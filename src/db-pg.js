@@ -2,6 +2,9 @@ import pg from 'pg';
 
 const { Pool } = pg;
 
+// Parse PostgreSQL BIGINT (OID 20) as JavaScript numbers (safe up to 9,007,199,254,740,991)
+pg.types.setTypeParser(20, (val) => (val === null ? null : parseInt(val, 10)));
+
 // Schema version tracking: uses the 'meta' table with key 'schema_version'
 // instead of SQLite's PRAGMA user_version.
 

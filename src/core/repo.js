@@ -220,7 +220,7 @@ export class AccountRepo {
 
   async countProfiles() {
     const row = await this.db.get('SELECT COUNT(*) AS n FROM profiles WHERE account_id = $1 AND deleted_at IS NULL', [this.accountId]);
-    return row.n;
+    return Number(row?.n || 0);
   }
 
   // ── the bin (deleted profiles, kept BIN_DAYS) ────────────────────────────
@@ -462,7 +462,7 @@ export class Accounts {
 
   async count() {
     const row = await this.db.get('SELECT COUNT(*) AS n FROM accounts');
-    return row.n;
+    return Number(row?.n || 0);
   }
 
   async byStremioUserId(stremioUserId) {

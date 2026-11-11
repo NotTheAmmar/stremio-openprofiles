@@ -4,7 +4,7 @@ import http from 'node:http';
 import { describe, it, beforeEach } from 'node:test';
 import { Cipher } from '../src/crypto.js';
 import { checkSecretKey } from '../src/core/keycheck.js';
-import { AccountsService } from '../src/core/accounts.js';
+import { AccountsService, accessDecision } from '../src/core/accounts.js';
 import { Settings } from '../src/core/settings.js';
 import { createAuth } from '../src/web/auth.js';
 import { createApp } from '../src/web/app.js';
@@ -528,6 +528,18 @@ describe('Supabase PostgreSQL OpenProfiles Test Suite', () => {
   });
 
   describe('3. Account Sign In & Profile Lifecycle', () => {
+    it('correctly handles owner access decision when account count is returned as string from PostgreSQL', () => {
+      const u = { id: 'u-1', email: 'owner@example.com' };
+      // Postgres COUNT(*) can return '0' as string due to 64-bit bigint
+      assert.equal(accessDecision({ mode: 'owner' }, { user: u, existing: null, accountCount: '0' }), null);
+      assert.equal(accessDecision({ mode: 'owner' }, { user: u, existing: null, accountCount: 0 }), null);
+      assert.match(accessDecision({ mode: 'owner' }, { user: u, existing: null, accountCount: '1' }), /belongs to someone/);
+      assert.match(accessDecision({ mode: 'owner' }, { user: u, existing: null, accountCount: 1 }), /belongs to someone/);
+      // Existing accounts or admin should always be allowed
+      assert.equal(accessDecision({ mode: 'owner' }, { user: u, existing: { id: 1 }, accountCount: '1' }), null);
+      assert.equal(accessDecision({ mode: 'owner' }, { user: u, existing: null, accountCount: '1', admin: true }), null);
+    });
+
     it('signs in, creates "Original" profile, and switches profiles', async () => {
       const { accountId, created } = await accounts.signIn('user@example.com', 'pass123');
       assert.equal(created, true);

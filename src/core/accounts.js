@@ -16,16 +16,17 @@ import {
  */
 export function accessDecision({ mode, allowed = [], maxAccounts = Infinity }, { user, existing, accountCount, admin = false }) {
   if (admin) return null;
+  const count = Number(accountCount || 0);
   const listed = allowed.some((entry) => entry.toLowerCase() === user.email.toLowerCase() || entry === user.id);
   if (mode === 'list') {
     return listed ? null : "Your Stremio account isn't on this server's list. Ask whoever runs it to add you.";
   }
   if (existing) return null;
   if (mode === 'open') {
-    return accountCount < maxAccounts ? null : 'This server is full. Try again later or run your own (it is free and open source).';
+    return count < maxAccounts ? null : 'This server is full. Try again later or run your own (it is free and open source).';
   }
   // owner
-  return accountCount === 0 ? null : 'This OpenProfiles server already belongs to someone. You can run your own; it is free and open source.';
+  return count === 0 ? null : 'This OpenProfiles server already belongs to someone. You can run your own; it is free and open source.';
 }
 
 /**

@@ -72,7 +72,8 @@ async function main() {
   });
 
   const openCount = await db.get("SELECT COUNT(*) AS n FROM switch_journal WHERE status = 'open'");
-  if (openCount?.n) log.warn('Some earlier switches did not finish; each account sees a recovery prompt on its page', { open: openCount.n });
+  const openN = Number(openCount?.n || 0);
+  if (openN > 0) log.warn('Some earlier switches did not finish; each account sees a recovery prompt on its page', { open: openN });
   const accountCount = await accounts.accounts.count();
   log.info('Access rule', { mode: settings.access().mode, accounts: accountCount });
 

@@ -13,7 +13,7 @@ const LATE_MS = 26 * 60 * 60 * 1000;
  * per-account rows, and errors are grouped by their fixed log message.
  */
 export async function serverStats({ db, settings, log, startedAt, now = Date.now() }) {
-  const one = async (sql, ...args) => (await db.get(sql, args)).n;
+  const one = async (sql, ...args) => Number((await db.get(sql, args))?.n || 0);
   const weekAgo = now - 7 * DAY_MS;
 
   const access = settings.access();
@@ -22,10 +22,10 @@ export async function serverStats({ db, settings, log, startedAt, now = Date.now
     mode: access.mode,
     limit: access.mode === 'open' && Number.isFinite(access.maxAccounts) ? access.maxAccounts : null,
     newThisWeek: await one('SELECT COUNT(*) AS n FROM accounts WHERE created_at > $1', weekAgo),
-    usedThisWeek: (await db.get(`SELECT COUNT(*) AS n FROM accounts a WHERE ${USED_SINCE}`, [weekAgo])).n,
+    usedThisWeek: Number((await db.get(`SELECT COUNT(*) AS n FROM accounts a WHERE ${USED_SINCE}`, [weekAgo]))?.n || 0),
     installed: await one('SELECT COUNT(*) AS n FROM accounts WHERE addon_installed = 1'),
-    unused: (await db.get(`SELECT COUNT(*) AS n FROM accounts a WHERE a.created_at <= $1 AND NOT ${USED_SINCE}`,
-      [now - UNUSED_DAYS * DAY_MS])).n,
+    unused: Number((await db.get(`SELECT COUNT(*) AS n FROM accounts a WHERE a.created_at <= $1 AND NOT ${USED_SINCE}`,
+      [now - UNUSED_DAYS * DAY_MS]))?.n || 0),
     unusedDays: UNUSED_DAYS,
     // Shared servers remove accounts left unused this long (null: never).
     removeAfterDays: access.mode === 'open' ? settings.get('removeUnusedDays') || null : null,
