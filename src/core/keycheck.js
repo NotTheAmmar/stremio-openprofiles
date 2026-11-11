@@ -12,23 +12,23 @@ const fingerprintOf = (key) => crypto.createHmac('sha256', key).update('openprof
  * rest of the data doesn't use. The fingerprint is stored on first boot; a
  * database from before fingerprints is checked by decrypting a stored key.
  */
-export function checkSecretKey(db, key, cipher) {
+export async function checkSecretKey(db, key, cipher) {
   const fingerprint = fingerprintOf(key);
-  const stored = db.prepare("SELECT value FROM meta WHERE key = 'key_fingerprint'").get()?.value;
+  const stored = (await db.get("SELECT value FROM meta WHERE key = $1", ['key_fingerprint']))?.value;
   if (stored) {
     if (stored !== fingerprint) throw new WrongKeyError(wrongKeyMessage());
     return;
   }
-  const sample = db.prepare('SELECT id, auth_key_enc FROM accounts WHERE enc_version = 2 LIMIT 1').get();
+  const sample = await db.get('SELECT id, auth_key_enc FROM accounts WHERE enc_version = 2 LIMIT 1');
   // Data from before accounts were bound into the encryption (enc_version 1) is checked the old way.
-  const legacy = sample ? null : db.prepare('SELECT auth_key_enc FROM accounts WHERE enc_version = 1 LIMIT 1').get();
+  const legacy = sample ? null : await db.get('SELECT auth_key_enc FROM accounts WHERE enc_version = 1 LIMIT 1');
   try {
     if (sample) accountCipher(cipher, sample.id).decryptJson(sample.auth_key_enc, 'authkey');
     else if (legacy) cipher.decryptJson(legacy.auth_key_enc, 'authkey');
   } catch {
     throw new WrongKeyError(wrongKeyMessage());
   }
-  db.prepare("INSERT INTO meta (key, value) VALUES ('key_fingerprint', ?)").run(fingerprint);
+  await db.run("INSERT INTO meta (key, value) VALUES ($1, $2)", ['key_fingerprint', fingerprint]);
 }
 
 function wrongKeyMessage() {

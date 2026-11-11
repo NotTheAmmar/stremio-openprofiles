@@ -27,11 +27,11 @@ export function snapshotHash({ library, addons, notifs }) {
  * (a switch from Stremio counts), or Stremio asked its add-on for something. One rule for the
  * Server tab's counts and for removing unused accounts.
  */
-export const USED_SINCE = `(a.last_login_at > @since
-    OR COALESCE(a.last_addon_at, 0) > @since
-    OR COALESCE(a.last_seen_at, 0) > @since
-    OR EXISTS (SELECT 1 FROM activity WHERE account_id = a.id AND at > @since)
-    OR EXISTS (SELECT 1 FROM sessions WHERE account_id = a.id AND last_seen_at > @since))`;
+export const USED_SINCE = `(a.last_login_at > $1
+    OR COALESCE(a.last_addon_at, 0) > $1
+    OR COALESCE(a.last_seen_at, 0) > $1
+    OR EXISTS (SELECT 1 FROM activity WHERE account_id = a.id AND at > $1)
+    OR EXISTS (SELECT 1 FROM sessions WHERE account_id = a.id AND last_seen_at > $1))`;
 const ADDON_TOUCH_MS = 60 * 60 * 1000;
 
 const ACCOUNT_COLUMNS = `id, stremio_user_id, stremio_email, auth_key_enc, addon_token, active_profile_id,
@@ -61,8 +61,16 @@ export class AccountRepo {
     this.now = now;
   }
 
-  transaction(fn) {
-    return this.db.transaction(fn)();
+  async transaction(fn) {
+    return await this.db.transaction(async (tx) => {
+      const prevDb = this.db;
+      this.db = tx;
+      try {
+        return await fn(this);
+      } finally {
+        this.db = prevDb;
+      }
+    });
   }
 
   encodeSnapshot({ library, addons, notifs }) {
@@ -78,183 +86,198 @@ export class AccountRepo {
 
   // ── account ──────────────────────────────────────────────────────────────
 
-  getAccount() {
-    return this.db.prepare(`SELECT ${ACCOUNT_COLUMNS} FROM accounts WHERE id = ?`).get(this.accountId) || null;
+  async getAccount() {
+    return await this.db.get(`SELECT ${ACCOUNT_COLUMNS} FROM accounts WHERE id = $1`, [this.accountId]) || null;
   }
 
-  updateAuthKey({ email, authKey }) {
-    this.db.prepare('UPDATE accounts SET stremio_email = ?, auth_key_enc = ?, last_login_at = ? WHERE id = ?')
-      .run(email, this.cipher.encryptJson(authKey, 'authkey'), this.now(), this.accountId);
+  async updateAuthKey({ email, authKey }) {
+    await this.db.run('UPDATE accounts SET stremio_email = $1, auth_key_enc = $2, last_login_at = $3 WHERE id = $4',
+      [email, this.cipher.encryptJson(authKey, 'authkey'), this.now(), this.accountId]);
   }
 
-  getAuthKey() {
-    const row = this.getAccount();
+  async getAuthKey() {
+    const row = await this.getAccount();
     return row ? this.cipher.decryptJson(row.auth_key_enc, 'authkey') : null;
   }
 
   // ── state (lives on the account row) ─────────────────────────────────────
 
-  getState() {
-    return this.db.prepare('SELECT active_profile_id, addon_token, addon_installed, notifs_foreign FROM accounts WHERE id = ?')
-      .get(this.accountId) || null;
+  async getState() {
+    return await this.db.get('SELECT active_profile_id, addon_token, addon_installed, notifs_foreign FROM accounts WHERE id = $1',
+      [this.accountId]) || null;
   }
 
-  setActiveProfile(id) {
-    this.db.prepare('UPDATE accounts SET active_profile_id = ? WHERE id = ?').run(id, this.accountId);
+  async setActiveProfile(id) {
+    await this.db.run('UPDATE accounts SET active_profile_id = $1 WHERE id = $2', [id, this.accountId]);
   }
 
-  setAddonToken(token) {
-    this.db.prepare('UPDATE accounts SET addon_token = ? WHERE id = ?').run(token, this.accountId);
+  async setAddonToken(token) {
+    await this.db.run('UPDATE accounts SET addon_token = $1 WHERE id = $2', [token, this.accountId]);
   }
 
   /** Whether Stremio's notifications belong to some other profile than the active one. */
-  setNotifsForeign(foreign) {
-    this.db.prepare('UPDATE accounts SET notifs_foreign = ? WHERE id = ?').run(foreign ? 1 : 0, this.accountId);
+  async setNotifsForeign(foreign) {
+    await this.db.run('UPDATE accounts SET notifs_foreign = $1 WHERE id = $2', [foreign ? 1 : 0, this.accountId]);
   }
 
-  setAddonInstalled(installed) {
-    this.db.prepare('UPDATE accounts SET addon_installed = ? WHERE id = ?').run(installed ? 1 : 0, this.accountId);
+  async setAddonInstalled(installed) {
+    await this.db.run('UPDATE accounts SET addon_installed = $1 WHERE id = $2', [installed ? 1 : 0, this.accountId]);
   }
 
   // ── profiles ─────────────────────────────────────────────────────────────
 
-  listProfiles() {
-    return this.db.prepare(`SELECT ${PROFILE_META} FROM profiles
-      WHERE account_id = ? AND deleted_at IS NULL ORDER BY created_at, id`).all(this.accountId);
+  async listProfiles() {
+    return await this.db.all(`SELECT ${PROFILE_META} FROM profiles
+      WHERE account_id = $1 AND deleted_at IS NULL ORDER BY created_at, id`, [this.accountId]);
   }
 
-  getProfile(id) {
-    return this.db.prepare(`SELECT ${PROFILE_META} FROM profiles
-      WHERE id = ? AND account_id = ? AND deleted_at IS NULL`).get(id, this.accountId) || null;
+  async getProfile(id) {
+    return await this.db.get(`SELECT ${PROFILE_META} FROM profiles
+      WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL`, [id, this.accountId]) || null;
   }
 
   /** Includes the encrypted blobs. */
-  getProfileRow(id) {
-    return this.db.prepare('SELECT * FROM profiles WHERE id = ? AND account_id = ? AND deleted_at IS NULL')
-      .get(id, this.accountId) || null;
+  async getProfileRow(id) {
+    return await this.db.get('SELECT * FROM profiles WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL',
+      [id, this.accountId]) || null;
   }
 
-  insertProfile({ name, avatarPreset, avatarColour, stremioUserId, snapshot }) {
+  async insertProfile({ name, avatarPreset, avatarColour, stremioUserId, snapshot }) {
     const enc = this.encodeSnapshot(snapshot);
     const now = this.now();
-    const info = this.db.prepare(`INSERT INTO profiles
+    const row = await this.db.get(`INSERT INTO profiles
       (account_id, name, avatar_preset, avatar_colour, library_enc, addons_enc, notifs_enc, library_count, addon_count,
        notif_count, snapshot_taken_at, stremio_user_id, created_at)
-      VALUES (@accountId, @name, @avatarPreset, @avatarColour, @library_enc, @addons_enc, @notifs_enc, @library_count,
-       @addon_count, @notif_count, @now, @stremioUserId, @now)`)
-      .run({ accountId: this.accountId, name, avatarPreset, avatarColour, stremioUserId, now, ...enc });
-    return Number(info.lastInsertRowid);
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $11)
+      RETURNING id`,
+      [this.accountId, name, avatarPreset, avatarColour, enc.library_enc, enc.addons_enc, enc.notifs_enc,
+       enc.library_count, enc.addon_count, enc.notif_count, now, stremioUserId]);
+    return Number(row.id);
   }
 
   /** `snapshot.notifs === null` keeps the previously saved notifications. */
-  saveProfileSnapshot(id, snapshot) {
+  async saveProfileSnapshot(id, snapshot) {
     const enc = this.encodeSnapshot(snapshot);
     const keepNotifs = snapshot.notifs == null;
-    this.db.prepare(`UPDATE profiles SET library_enc = @library_enc, addons_enc = @addons_enc,
-        library_count = @library_count, addon_count = @addon_count, snapshot_taken_at = @now
-        ${keepNotifs ? '' : ', notifs_enc = @notifs_enc, notif_count = @notif_count'}
-      WHERE id = @id AND account_id = @accountId`).run({ id, accountId: this.accountId, now: this.now(), ...enc });
+    if (keepNotifs) {
+      await this.db.run(`UPDATE profiles SET library_enc = $1, addons_enc = $2,
+          library_count = $3, addon_count = $4, snapshot_taken_at = $5
+        WHERE id = $6 AND account_id = $7`,
+        [enc.library_enc, enc.addons_enc, enc.library_count, enc.addon_count, this.now(), id, this.accountId]);
+    } else {
+      await this.db.run(`UPDATE profiles SET library_enc = $1, addons_enc = $2,
+          library_count = $3, addon_count = $4, snapshot_taken_at = $5,
+          notifs_enc = $6, notif_count = $7
+        WHERE id = $8 AND account_id = $9`,
+        [enc.library_enc, enc.addons_enc, enc.library_count, enc.addon_count, this.now(),
+         enc.notifs_enc, enc.notif_count, id, this.accountId]);
+    }
   }
 
   /** Replace only the saved library; the add-ons, notifications and "saved at" time stay. */
-  saveProfileLibrary(id, library) {
-    this.db.prepare('UPDATE profiles SET library_enc = ?, library_count = ? WHERE id = ? AND account_id = ?')
-      .run(this.cipher.encryptJson(library, 'library'), countActive(library), id, this.accountId);
+  async saveProfileLibrary(id, library) {
+    await this.db.run('UPDATE profiles SET library_enc = $1, library_count = $2 WHERE id = $3 AND account_id = $4',
+      [this.cipher.encryptJson(library, 'library'), countActive(library), id, this.accountId]);
   }
 
   /** Replace only the saved add-on list; the library, notifications and "saved at" time stay. */
-  saveProfileAddons(id, addons) {
-    this.db.prepare('UPDATE profiles SET addons_enc = ?, addon_count = ? WHERE id = ? AND account_id = ?')
-      .run(this.cipher.encryptJson(addons, 'addons'), addons.length, id, this.accountId);
+  async saveProfileAddons(id, addons) {
+    await this.db.run('UPDATE profiles SET addons_enc = $1, addon_count = $2 WHERE id = $3 AND account_id = $4',
+      [this.cipher.encryptJson(addons, 'addons'), addons.length, id, this.accountId]);
   }
 
-  renameProfile(id, name) {
-    this.db.prepare('UPDATE profiles SET name = ? WHERE id = ? AND account_id = ?').run(name, id, this.accountId);
+  async renameProfile(id, name) {
+    await this.db.run('UPDATE profiles SET name = $1 WHERE id = $2 AND account_id = $3', [name, id, this.accountId]);
   }
 
-  setProfileAvatar(id, preset, colour) {
-    this.db.prepare('UPDATE profiles SET avatar_preset = ?, avatar_colour = ? WHERE id = ? AND account_id = ?')
-      .run(preset, colour, id, this.accountId);
+  async setProfileAvatar(id, preset, colour) {
+    await this.db.run('UPDATE profiles SET avatar_preset = $1, avatar_colour = $2 WHERE id = $3 AND account_id = $4',
+      [preset, colour, id, this.accountId]);
   }
 
   /** The profile's uploaded photo (JPEG bytes), or null. Works for profiles in the bin too. */
-  getProfilePhoto(id) {
-    const row = this.db.prepare('SELECT photo_enc FROM profiles WHERE id = ? AND account_id = ?').get(id, this.accountId);
+  async getProfilePhoto(id) {
+    const row = await this.db.get('SELECT photo_enc FROM profiles WHERE id = $1 AND account_id = $2', [id, this.accountId]);
     return row?.photo_enc ? Buffer.from(this.cipher.decryptJson(row.photo_enc, 'photo'), 'base64') : null;
   }
 
   /** `jpeg` null removes the photo. The hash is what avatar_preset 'photo:<hash>' points at. */
-  setProfilePhoto(id, jpeg, hash) {
-    this.db.prepare('UPDATE profiles SET photo_enc = ?, photo_hash = ? WHERE id = ? AND account_id = ?')
-      .run(jpeg ? this.cipher.encryptJson(jpeg.toString('base64'), 'photo') : null, jpeg ? hash : null, id, this.accountId);
+  async setProfilePhoto(id, jpeg, hash) {
+    await this.db.run('UPDATE profiles SET photo_enc = $1, photo_hash = $2 WHERE id = $3 AND account_id = $4',
+      [jpeg ? this.cipher.encryptJson(jpeg.toString('base64'), 'photo') : null, jpeg ? hash : null, id, this.accountId]);
   }
 
   /** The profile's passcode hash (core/passcode.js), or null when it isn't locked. */
-  getPasscodeHash(id) {
-    return this.db.prepare('SELECT passcode_hash FROM profiles WHERE id = ? AND account_id = ?').get(id, this.accountId)?.passcode_hash ?? null;
+  async getPasscodeHash(id) {
+    const row = await this.db.get('SELECT passcode_hash FROM profiles WHERE id = $1 AND account_id = $2', [id, this.accountId]);
+    return row?.passcode_hash ?? null;
   }
 
   /** `hash` null removes the lock. */
-  setPasscodeHash(id, hash) {
-    this.db.prepare('UPDATE profiles SET passcode_hash = ? WHERE id = ? AND account_id = ?').run(hash, id, this.accountId);
+  async setPasscodeHash(id, hash) {
+    await this.db.run('UPDATE profiles SET passcode_hash = $1 WHERE id = $2 AND account_id = $3', [hash, id, this.accountId]);
   }
 
-  countProfiles() {
-    return this.db.prepare('SELECT COUNT(*) AS n FROM profiles WHERE account_id = ? AND deleted_at IS NULL').get(this.accountId).n;
+  async countProfiles() {
+    const row = await this.db.get('SELECT COUNT(*) AS n FROM profiles WHERE account_id = $1 AND deleted_at IS NULL', [this.accountId]);
+    return row.n;
   }
 
   // ── the bin (deleted profiles, kept BIN_DAYS) ────────────────────────────
 
-  moveProfileToBin(id) {
-    this.db.prepare('UPDATE profiles SET deleted_at = ? WHERE id = ? AND account_id = ? AND deleted_at IS NULL')
-      .run(this.now(), id, this.accountId);
+  async moveProfileToBin(id) {
+    await this.db.run('UPDATE profiles SET deleted_at = $1 WHERE id = $2 AND account_id = $3 AND deleted_at IS NULL',
+      [this.now(), id, this.accountId]);
   }
 
-  listBin() {
-    return this.db.prepare(`SELECT ${PROFILE_META}, deleted_at FROM profiles
-      WHERE account_id = ? AND deleted_at IS NOT NULL ORDER BY deleted_at DESC`).all(this.accountId);
+  async listBin() {
+    return await this.db.all(`SELECT ${PROFILE_META}, deleted_at FROM profiles
+      WHERE account_id = $1 AND deleted_at IS NOT NULL ORDER BY deleted_at DESC`, [this.accountId]);
   }
 
-  getBinProfile(id) {
-    return this.db.prepare(`SELECT ${PROFILE_META}, deleted_at FROM profiles
-      WHERE id = ? AND account_id = ? AND deleted_at IS NOT NULL`).get(id, this.accountId) || null;
+  async getBinProfile(id) {
+    return await this.db.get(`SELECT ${PROFILE_META}, deleted_at FROM profiles
+      WHERE id = $1 AND account_id = $2 AND deleted_at IS NOT NULL`, [id, this.accountId]) || null;
   }
 
   /** Includes the encrypted blobs. */
-  getBinProfileRow(id) {
-    return this.db.prepare('SELECT * FROM profiles WHERE id = ? AND account_id = ? AND deleted_at IS NOT NULL')
-      .get(id, this.accountId) || null;
+  async getBinProfileRow(id) {
+    return await this.db.get('SELECT * FROM profiles WHERE id = $1 AND account_id = $2 AND deleted_at IS NOT NULL',
+      [id, this.accountId]) || null;
   }
 
-  restoreProfileFromBin(id, name) {
-    this.db.prepare('UPDATE profiles SET deleted_at = NULL, name = ? WHERE id = ? AND account_id = ?').run(name, id, this.accountId);
+  async restoreProfileFromBin(id, name) {
+    await this.db.run('UPDATE profiles SET deleted_at = NULL, name = $1 WHERE id = $2 AND account_id = $3', [name, id, this.accountId]);
   }
 
   /** Keep at most `max` profiles in the bin, removing the longest-deleted first. */
-  trimBin(max) {
-    return this.db.prepare(`DELETE FROM profiles WHERE account_id = ? AND deleted_at IS NOT NULL AND id NOT IN
-      (SELECT id FROM profiles WHERE account_id = ? AND deleted_at IS NOT NULL ORDER BY deleted_at DESC, id DESC LIMIT ?)`)
-      .run(this.accountId, this.accountId, max).changes;
+  async trimBin(max) {
+    const result = await this.db.run(`DELETE FROM profiles WHERE account_id = $1 AND deleted_at IS NOT NULL AND id NOT IN
+      (SELECT id FROM profiles WHERE account_id = $1 AND deleted_at IS NOT NULL ORDER BY deleted_at DESC, id DESC LIMIT $2)`,
+      [this.accountId, max]);
+    return result.changes;
   }
 
   /** Permanently remove bin entries deleted before `before` (ms). Returns how many. */
-  purgeBin(before) {
-    return this.db.prepare('DELETE FROM profiles WHERE account_id = ? AND deleted_at IS NOT NULL AND deleted_at < ?')
-      .run(this.accountId, before).changes;
+  async purgeBin(before) {
+    const result = await this.db.run('DELETE FROM profiles WHERE account_id = $1 AND deleted_at IS NOT NULL AND deleted_at < $2',
+      [this.accountId, before]);
+    return result.changes;
   }
 
   // ── activity log ─────────────────────────────────────────────────────────
 
-  logActivity(kind, detail) {
-    this.db.prepare('INSERT INTO activity (account_id, at, kind, detail) VALUES (?, ?, ?, ?)')
-      .run(this.accountId, this.now(), kind, String(detail).slice(0, 300));
-    this.db.prepare(`DELETE FROM activity WHERE account_id = ? AND id NOT IN
-      (SELECT id FROM activity WHERE account_id = ? ORDER BY id DESC LIMIT ${ACTIVITY_KEEP})`).run(this.accountId, this.accountId);
+  async logActivity(kind, detail) {
+    await this.db.run('INSERT INTO activity (account_id, at, kind, detail) VALUES ($1, $2, $3, $4)',
+      [this.accountId, this.now(), kind, String(detail).slice(0, 300)]);
+    await this.db.run(`DELETE FROM activity WHERE account_id = $1 AND id NOT IN
+      (SELECT id FROM activity WHERE account_id = $1 ORDER BY id DESC LIMIT ${ACTIVITY_KEEP})`,
+      [this.accountId]);
   }
 
-  listActivity(limit = 30) {
-    return this.db.prepare('SELECT at, kind, detail FROM activity WHERE account_id = ? ORDER BY id DESC LIMIT ?')
-      .all(this.accountId, limit);
+  async listActivity(limit = 30) {
+    return await this.db.all('SELECT at, kind, detail FROM activity WHERE account_id = $1 ORDER BY id DESC LIMIT $2',
+      [this.accountId, limit]);
   }
 
   // ── backups ──────────────────────────────────────────────────────────────
@@ -263,81 +286,82 @@ export class AccountRepo {
    * `profileId`: for pre_change backups, the profile whose saved state this is (undo puts it back there).
    * `editKind`: for pre_change backups, what the edit was ('addons' | 'cinemeta' | 'undo').
    */
-  insertBackup({ kind, label, stremioUserId, snapshot, profileId = null, editKind = null, createdAt = null }) {
+  async insertBackup({ kind, label, stremioUserId, snapshot, profileId = null, editKind = null, createdAt = null }) {
     const enc = this.encodeSnapshot(snapshot);
     const now = this.now();
     const at = Number.isFinite(createdAt) && createdAt > 0 ? Math.min(createdAt, now) : now;
     // Whose state it is: the edited profile for an edit, else the one in use now; an import's is unknown.
-    const held = kind === 'imported' ? null : profileId ?? this.getState()?.active_profile_id ?? null;
-    const info = this.db.prepare(`INSERT INTO backups
+    const held = kind === 'imported' ? null : profileId ?? (await this.getState())?.active_profile_id ?? null;
+    const row = await this.db.get(`INSERT INTO backups
       (account_id, kind, label, library_enc, addons_enc, notifs_enc, library_count, addon_count, notif_count,
        stremio_user_id, created_at, content_hash, profile_id, edit_kind, held_profile_id)
-      VALUES (@accountId, @kind, @label, @library_enc, @addons_enc, @notifs_enc, @library_count, @addon_count,
-       @notif_count, @stremioUserId, @now, @contentHash, @profileId, @editKind, @held)`)
-      .run({ accountId: this.accountId, kind, label, stremioUserId, now: at, contentHash: snapshotHash(snapshot), profileId, editKind, held, ...enc });
-    return Number(info.lastInsertRowid);
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+      RETURNING id`,
+      [this.accountId, kind, label, enc.library_enc, enc.addons_enc, enc.notifs_enc, enc.library_count,
+       enc.addon_count, enc.notif_count, stremioUserId, at, snapshotHash(snapshot), profileId, editKind, held]);
+    return Number(row.id);
   }
 
   /** The newest add-on or Cinemeta edit since `since` that hasn't been undone, if its profile still exists. */
-  latestUndoableEdit(since) {
-    return this.db.prepare(`SELECT b.id, b.label, b.created_at, b.edit_kind, b.profile_id, p.name AS profile_name
+  async latestUndoableEdit(since) {
+    return await this.db.get(`SELECT b.id, b.label, b.created_at, b.edit_kind, b.profile_id, p.name AS profile_name
       FROM backups b JOIN profiles p ON p.id = b.profile_id AND p.deleted_at IS NULL
-      WHERE b.account_id = ? AND b.kind = 'pre_change' AND b.edit_kind IN ('addons', 'cinemeta')
-        AND b.undone_at IS NULL AND b.created_at >= ?
-      ORDER BY b.created_at DESC, b.id DESC LIMIT 1`).get(this.accountId, since) || null;
+      WHERE b.account_id = $1 AND b.kind = 'pre_change' AND b.edit_kind IN ('addons', 'cinemeta')
+        AND b.undone_at IS NULL AND b.created_at >= $2
+      ORDER BY b.created_at DESC, b.id DESC LIMIT 1`, [this.accountId, since]) || null;
   }
 
   /** For an edit's backup: the add-on list the edit wrote. */
-  setAfterHash(id, hash) {
-    this.db.prepare('UPDATE backups SET after_hash = ? WHERE id = ? AND account_id = ?').run(hash, id, this.accountId);
+  async setAfterHash(id, hash) {
+    await this.db.run('UPDATE backups SET after_hash = $1 WHERE id = $2 AND account_id = $3', [hash, id, this.accountId]);
   }
 
-  markUndone(id) {
-    this.db.prepare('UPDATE backups SET undone_at = ? WHERE id = ? AND account_id = ?').run(this.now(), id, this.accountId);
+  async markUndone(id) {
+    await this.db.run('UPDATE backups SET undone_at = $1 WHERE id = $2 AND account_id = $3', [this.now(), id, this.accountId]);
   }
 
   /** Newest backup of a kind (metadata and hash only), or null. */
-  latestBackup(kind) {
-    return this.db.prepare(`SELECT ${BACKUP_META}, content_hash FROM backups WHERE account_id = ? AND kind = ?
-      ORDER BY created_at DESC, id DESC LIMIT 1`).get(this.accountId, kind) || null;
+  async latestBackup(kind) {
+    return await this.db.get(`SELECT ${BACKUP_META}, content_hash FROM backups WHERE account_id = $1 AND kind = $2
+      ORDER BY created_at DESC, id DESC LIMIT 1`, [this.accountId, kind]) || null;
   }
 
-  listBackups() {
-    return this.db.prepare(`SELECT ${BACKUP_META} FROM backups WHERE account_id = ?
-      ORDER BY created_at DESC, id DESC`).all(this.accountId);
+  async listBackups() {
+    return await this.db.all(`SELECT ${BACKUP_META} FROM backups WHERE account_id = $1
+      ORDER BY created_at DESC, id DESC`, [this.accountId]);
   }
 
-  getBackup(id) {
-    return this.db.prepare(`SELECT ${BACKUP_META} FROM backups WHERE id = ? AND account_id = ?`)
-      .get(id, this.accountId) || null;
+  async getBackup(id) {
+    return await this.db.get(`SELECT ${BACKUP_META} FROM backups WHERE id = $1 AND account_id = $2`,
+      [id, this.accountId]) || null;
   }
 
-  getBackupRow(id) {
-    return this.db.prepare('SELECT * FROM backups WHERE id = ? AND account_id = ?').get(id, this.accountId) || null;
+  async getBackupRow(id) {
+    return await this.db.get('SELECT * FROM backups WHERE id = $1 AND account_id = $2', [id, this.accountId]) || null;
   }
 
-  deleteBackup(id) {
-    this.db.prepare('DELETE FROM backups WHERE id = ? AND account_id = ?').run(id, this.accountId);
+  async deleteBackup(id) {
+    await this.db.run('DELETE FROM backups WHERE id = $1 AND account_id = $2', [id, this.accountId]);
   }
 
   /** Backups an open journal row may still need for recovery. */
-  pinnedBackupIds() {
-    const rows = this.db.prepare(`SELECT target_backup_id, rollback_backup_id FROM switch_journal
-      WHERE account_id = ? AND status = 'open'`).all(this.accountId);
+  async pinnedBackupIds() {
+    const rows = await this.db.all(`SELECT target_backup_id, rollback_backup_id FROM switch_journal
+      WHERE account_id = $1 AND status = 'open'`, [this.accountId]);
     return new Set(rows.flatMap((r) => [r.target_backup_id, r.rollback_backup_id]).filter((id) => id != null));
   }
 
   /** Apply BACKUP_RETENTION, newest kept. Returns how many were deleted. */
-  pruneBackups() {
-    const pinned = this.pinnedBackupIds();
+  async pruneBackups() {
+    const pinned = await this.pinnedBackupIds();
     let deleted = 0;
     for (const [kind, keep] of Object.entries(BACKUP_RETENTION)) {
       if (keep === Infinity) continue;
-      const rows = this.db.prepare(`SELECT id FROM backups WHERE account_id = ? AND kind = ?
-        ORDER BY created_at DESC, id DESC`).all(this.accountId, kind);
+      const rows = await this.db.all(`SELECT id FROM backups WHERE account_id = $1 AND kind = $2
+        ORDER BY created_at DESC, id DESC`, [this.accountId, kind]);
       for (const { id } of rows.slice(keep)) {
         if (pinned.has(id)) continue;
-        this.deleteBackup(id);
+        await this.deleteBackup(id);
         deleted++;
       }
     }
@@ -346,32 +370,34 @@ export class AccountRepo {
 
   // ── journal ──────────────────────────────────────────────────────────────
 
-  startJournal({ kind, fromProfileId, toProfileId, targetBackupId = null, rollbackBackupId }) {
-    const info = this.db.prepare(`INSERT INTO switch_journal
+  async startJournal({ kind, fromProfileId, toProfileId, targetBackupId = null, rollbackBackupId }) {
+    const row = await this.db.get(`INSERT INTO switch_journal
       (account_id, kind, from_profile_id, to_profile_id, target_backup_id, rollback_backup_id, phase, status, started_at)
-      VALUES (?, ?, ?, ?, ?, ?, 'saved', 'open', ?)`)
-      .run(this.accountId, kind, fromProfileId, toProfileId, targetBackupId, rollbackBackupId, this.now());
-    return Number(info.lastInsertRowid);
+      VALUES ($1, $2, $3, $4, $5, $6, 'saved', 'open', $7)
+      RETURNING id`,
+      [this.accountId, kind, fromProfileId, toProfileId, targetBackupId, rollbackBackupId, this.now()]);
+    return Number(row.id);
   }
 
-  setJournalPhase(id, phase) {
-    this.db.prepare('UPDATE switch_journal SET phase = ? WHERE id = ? AND account_id = ?').run(phase, id, this.accountId);
+  async setJournalPhase(id, phase) {
+    await this.db.run('UPDATE switch_journal SET phase = $1 WHERE id = $2 AND account_id = $3', [phase, id, this.accountId]);
   }
 
-  failJournal(id, error) {
-    this.db.prepare('UPDATE switch_journal SET error = ? WHERE id = ? AND account_id = ?')
-      .run(String(error).slice(0, 500), id, this.accountId);
+  async failJournal(id, error) {
+    await this.db.run('UPDATE switch_journal SET error = $1 WHERE id = $2 AND account_id = $3',
+      [String(error).slice(0, 500), id, this.accountId]);
   }
 
-  closeJournal(id, status, warnings = []) {
-    this.db.prepare(`UPDATE switch_journal SET status = ?, phase = 'done', finished_at = ?, error = NULL, warnings = ?
-      WHERE id = ? AND account_id = ?`).run(status, this.now(), JSON.stringify(warnings), id, this.accountId);
+  async closeJournal(id, status, warnings = []) {
+    await this.db.run(`UPDATE switch_journal SET status = $1, phase = 'done', finished_at = $2, error = NULL, warnings = $3
+      WHERE id = $4 AND account_id = $5`, [status, this.now(), JSON.stringify(warnings), id, this.accountId]);
   }
 
   // ── titles followed after a switch (core/carryover.js) ──────────────────
 
-  listCarryovers() {
-    return this.db.prepare('SELECT * FROM carryovers WHERE account_id = ? ORDER BY id').all(this.accountId).map((row) => ({
+  async listCarryovers() {
+    const rows = await this.db.all('SELECT * FROM carryovers WHERE account_id = $1 ORDER BY id', [this.accountId]);
+    return rows.map((row) => ({
       ownerProfileId: row.owner_profile_id,
       createdAt: row.created_at,
       changedAt: row.changed_at,
@@ -381,15 +407,15 @@ export class AccountRepo {
   }
 
   /** The account's whole list, replaced. Titles are viewing history, so they're encrypted. */
-  replaceCarryovers(records) {
-    this.db.prepare('DELETE FROM carryovers WHERE account_id = ?').run(this.accountId);
-    const insert = this.db.prepare(`INSERT INTO carryovers
-      (account_id, owner_profile_id, item_enc, created_at, changed_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)`);
+  async replaceCarryovers(records) {
+    await this.db.run('DELETE FROM carryovers WHERE account_id = $1', [this.accountId]);
     for (const r of records) {
       const enc = this.cipher.encryptJson({
         base: r.base, written: r.written, seenMtime: r.seenMtime ?? null, putMtime: r.putMtime ?? null,
       }, 'carryover');
-      insert.run(this.accountId, r.ownerProfileId, enc, r.createdAt, r.changedAt ?? null, r.expiresAt);
+      await this.db.run(`INSERT INTO carryovers
+        (account_id, owner_profile_id, item_enc, created_at, changed_at, expires_at) VALUES ($1, $2, $3, $4, $5, $6)`,
+        [this.accountId, r.ownerProfileId, enc, r.createdAt, r.changedAt ?? null, r.expiresAt]);
     }
   }
 
@@ -398,8 +424,8 @@ export class AccountRepo {
    * it (service.js strayRecords): `{ switchAt, fromProfileId, toProfileId }`,
    * or null. Kept in meta so a restart doesn't lose it.
    */
-  getSweep() {
-    const row = this.db.prepare('SELECT value FROM meta WHERE key = ?').get(`sweep:${this.accountId}`);
+  async getSweep() {
+    const row = await this.db.get('SELECT value FROM meta WHERE key = $1', [`sweep:${this.accountId}`]);
     try {
       return row ? JSON.parse(row.value) : null;
     } catch {
@@ -407,22 +433,22 @@ export class AccountRepo {
     }
   }
 
-  setSweep(sweep) {
+  async setSweep(sweep) {
     const key = `sweep:${this.accountId}`;
-    if (!sweep) this.db.prepare('DELETE FROM meta WHERE key = ?').run(key);
-    else this.db.prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value').run(key, JSON.stringify(sweep));
+    if (!sweep) await this.db.run('DELETE FROM meta WHERE key = $1', [key]);
+    else await this.db.run('INSERT INTO meta (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value', [key, JSON.stringify(sweep)]);
   }
 
-  getOpenJournal() {
-    const row = this.db.prepare(`SELECT * FROM switch_journal WHERE account_id = ? AND status = 'open'
-      ORDER BY id DESC LIMIT 1`).get(this.accountId);
+  async getOpenJournal() {
+    const row = await this.db.get(`SELECT * FROM switch_journal WHERE account_id = $1 AND status = 'open'
+      ORDER BY id DESC LIMIT 1`, [this.accountId]);
     return row ? { ...row, warnings: JSON.parse(row.warnings) } : null;
   }
 
-  recentJournal(limit = 10) {
-    return this.db.prepare('SELECT * FROM switch_journal WHERE account_id = ? ORDER BY id DESC LIMIT ?')
-      .all(this.accountId, limit)
-      .map((row) => ({ ...row, warnings: JSON.parse(row.warnings) }));
+  async recentJournal(limit = 10) {
+    const rows = await this.db.all('SELECT * FROM switch_journal WHERE account_id = $1 ORDER BY id DESC LIMIT $2',
+      [this.accountId, limit]);
+    return rows.map((row) => ({ ...row, warnings: JSON.parse(row.warnings) }));
   }
 }
 
@@ -434,48 +460,51 @@ export class Accounts {
     this.now = now;
   }
 
-  count() {
-    return this.db.prepare('SELECT COUNT(*) AS n FROM accounts').get().n;
+  async count() {
+    const row = await this.db.get('SELECT COUNT(*) AS n FROM accounts');
+    return row.n;
   }
 
-  byStremioUserId(stremioUserId) {
-    return this.db.prepare(`SELECT ${ACCOUNT_COLUMNS} FROM accounts WHERE stremio_user_id = ?`).get(stremioUserId) || null;
+  async byStremioUserId(stremioUserId) {
+    return await this.db.get(`SELECT ${ACCOUNT_COLUMNS} FROM accounts WHERE stremio_user_id = $1`, [stremioUserId]) || null;
   }
 
-  byId(id) {
-    return this.db.prepare(`SELECT ${ACCOUNT_COLUMNS} FROM accounts WHERE id = ?`).get(id) || null;
+  async byId(id) {
+    return await this.db.get(`SELECT ${ACCOUNT_COLUMNS} FROM accounts WHERE id = $1`, [id]) || null;
   }
 
-  byAddonToken(token) {
+  async byAddonToken(token) {
     if (typeof token !== 'string' || token.length < 16) return null;
-    return this.db.prepare(`SELECT ${ACCOUNT_COLUMNS} FROM accounts WHERE addon_token = ?`).get(token) || null;
+    return await this.db.get(`SELECT ${ACCOUNT_COLUMNS} FROM accounts WHERE addon_token = $1`, [token]) || null;
   }
 
   /** Inserts the row only; call inside the transaction that also creates the first profile. */
-  insert({ stremioUserId, email, authKey }) {
+  async insert({ stremioUserId, email, authKey }) {
     const now = this.now();
-    const info = this.db.prepare(`INSERT INTO accounts
+    const row = await this.db.get(`INSERT INTO accounts
       (stremio_user_id, stremio_email, auth_key_enc, addon_token, enc_version, created_at, last_login_at)
-      VALUES (?, ?, X'00', ?, 2, ?, ?)`).run(stremioUserId, email, randomToken(), now, now);
-    const id = Number(info.lastInsertRowid);
+      VALUES ($1, $2, '\\x00', $3, 2, $4, $5)
+      RETURNING id`, [stremioUserId, email, randomToken(), now, now]);
+    const id = Number(row.id);
     // The auth key is bound to the new id, so it can only be encrypted once the id exists.
-    this.db.prepare('UPDATE accounts SET auth_key_enc = ? WHERE id = ?')
-      .run(accountCipher(this.cipher, id).encryptJson(authKey, 'authkey'), id);
+    await this.db.run('UPDATE accounts SET auth_key_enc = $1 WHERE id = $2',
+      [accountCipher(this.cipher, id).encryptJson(authKey, 'authkey'), id]);
     return id;
   }
 
   /** Stremio used this account's add-on. Writes at most once an hour. */
-  touchAddon(id) {
+  async touchAddon(id) {
     const now = this.now();
-    this.db.prepare('UPDATE accounts SET last_addon_at = ? WHERE id = ? AND (last_addon_at IS NULL OR last_addon_at < ?)')
-      .run(now, id, now - ADDON_TOUCH_MS);
+    await this.db.run('UPDATE accounts SET last_addon_at = $1 WHERE id = $2 AND (last_addon_at IS NULL OR last_addon_at < $3)',
+      [now, id, now - ADDON_TOUCH_MS]);
   }
 
   /** Accounts following titles that kept playing after a switch, or with a switch still to look over. */
-  withCarryovers() {
-    return this.db.prepare(`SELECT account_id FROM carryovers
+  async withCarryovers() {
+    const rows = await this.db.all(`SELECT account_id FROM carryovers
       UNION SELECT CAST(substr(key, 7) AS INTEGER) FROM meta WHERE key LIKE 'sweep:%'
-      ORDER BY 1`).all().map((r) => r.account_id);
+      ORDER BY 1`);
+    return rows.map((r) => r.account_id);
   }
 
   /**
@@ -483,15 +512,16 @@ export class Accounts {
    * with a switch that never finished: its Stremio may be half-switched, and the
    * profiles to put it right are only here.
    */
-  unusedSince(since) {
-    return this.db.prepare(`SELECT a.id FROM accounts a WHERE a.created_at <= @since AND NOT ${USED_SINCE}
-      AND NOT EXISTS (SELECT 1 FROM switch_journal WHERE account_id = a.id AND status = 'open') ORDER BY a.id`)
-      .all({ since }).map((r) => r.id);
+  async unusedSince(since) {
+    const rows = await this.db.all(`SELECT a.id FROM accounts a WHERE a.created_at <= $1 AND NOT ${USED_SINCE}
+      AND NOT EXISTS (SELECT 1 FROM switch_journal WHERE account_id = a.id AND status = 'open') ORDER BY a.id`,
+      [since]);
+    return rows.map((r) => r.id);
   }
 
   /** Everything for the account goes with it (foreign keys cascade; its meta row by hand). */
-  delete(id) {
-    this.db.prepare('DELETE FROM accounts WHERE id = ?').run(id);
-    this.db.prepare('DELETE FROM meta WHERE key = ?').run(`sweep:${id}`);
+  async delete(id) {
+    await this.db.run('DELETE FROM accounts WHERE id = $1', [id]);
+    await this.db.run('DELETE FROM meta WHERE key = $1', [`sweep:${id}`]);
   }
 }

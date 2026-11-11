@@ -68,13 +68,13 @@ export class AccountsService {
   }
 
   /** The account an add-on URL token belongs to, or null. */
-  byAddonToken(token) {
-    const account = this.accounts.byAddonToken(token);
+  async byAddonToken(token) {
+    const account = await this.accounts.byAddonToken(token);
     return account ? { account, service: this.forAccount(account.id) } : null;
   }
 
-  getAccount(accountId) {
-    return this.accounts.byId(accountId);
+  async getAccount(accountId) {
+    return await this.accounts.byId(accountId);
   }
 
   /**
@@ -83,22 +83,22 @@ export class AccountsService {
    * again: if the owner deletes their account, nobody signing up after inherits
    * the server, and the owner signing in again owns it again. Null meanwhile.
    */
-  ownerId() {
-    const row = this.db.prepare(`SELECT a.id FROM meta m JOIN accounts a ON a.stremio_user_id = m.value
-      WHERE m.key = 'owner_stremio_user_id'`).get();
+  async ownerId() {
+    const row = await this.db.get(`SELECT a.id FROM meta m JOIN accounts a ON a.stremio_user_id = m.value
+      WHERE m.key = 'owner_stremio_user_id'`);
     return row ? row.id : null;
   }
 
-  isOwner(user) {
-    const row = this.db.prepare("SELECT value FROM meta WHERE key = 'owner_stremio_user_id'").get();
+  async isOwner(user) {
+    const row = await this.db.get("SELECT value FROM meta WHERE key = 'owner_stremio_user_id'");
     return Boolean(row?.value) && row.value === user.id;
   }
 
   /** Whether this account runs the server (and sees the Server tab). */
-  isAdmin(accountId) {
+  async isAdmin(accountId) {
     if (accountId == null) return false;
-    if (accountId === this.ownerId()) return true;
-    const account = this.accounts.byId(accountId);
+    if (accountId === await this.ownerId()) return true;
+    const account = await this.accounts.byId(accountId);
     return Boolean(account && this.listedAdmin({ email: account.stremio_email, id: account.stremio_user_id }));
   }
 
@@ -106,17 +106,18 @@ export class AccountsService {
     return this.admins.some((entry) => entry.toLowerCase() === String(user.email).toLowerCase() || entry === user.id);
   }
 
-  signIn(email, password) {
+  async signIn(email, password) {
     return this.signInLock.run(async () => {
       const authKey = await this.stremio.login(email, password);
       const user = await this.stremio.getUser(authKey);
       if (user.parentId) {
         throw new UserError('CHILD_PROFILE', 'That sign-in belongs to a profile inside another Stremio account. Sign in with the main account.');
       }
-      const existing = this.accounts.byStremioUserId(user.id);
+      const existing = await this.accounts.byStremioUserId(user.id);
       const access = this.access();
-      const admin = this.isOwner(user) || this.listedAdmin(user);
-      const refusal = accessDecision(access, { user, existing, accountCount: this.accounts.count(), admin });
+      const admin = (await this.isOwner(user)) || this.listedAdmin(user);
+      const accountCount = await this.accounts.count();
+      const refusal = accessDecision(access, { user, existing, accountCount, admin });
       if (refusal) {
         this.log.warn('Sign-in refused by the access rule', { mode: access.mode });
         throw new UserError('NOT_ALLOWED', refusal);
@@ -125,8 +126,8 @@ export class AccountsService {
       if (user.userProfiles && Object.keys(user.userProfiles).length > 1) warnings.push(NATIVE_PROFILES_WARNING);
 
       if (existing) {
-        this.forAccount(existing.id).repo.updateAuthKey({ email: user.email, authKey });
-        this.forAccount(existing.id).repo.logActivity('signin', 'Signed in');
+        await this.forAccount(existing.id).repo.updateAuthKey({ email: user.email, authKey });
+        await this.forAccount(existing.id).repo.logActivity('signin', 'Signed in');
         this.log.info('Signed in', { accountId: existing.id });
         return { accountId: existing.id, created: false, warnings };
       }
@@ -137,18 +138,26 @@ export class AccountsService {
         throw new UserError('NO_ADDONS', 'This Stremio account has no add-ons installed. Install Cinemeta in Stremio, then sign in again.');
       }
       const snapshot = { library: live.library, addons: live.addons, notifs: live.notifs };
-      const accountId = this.db.transaction(() => {
-        const id = this.accounts.insert({ stremioUserId: user.id, email: user.email, authKey });
-        const repo = new AccountRepo(this.db, this.cipher, id, this.now);
-        const profileId = repo.insertProfile({ name: 'Original', avatarPreset: 'initial', avatarColour: DEFAULT_COLOUR, stremioUserId: user.id, snapshot });
-        repo.setActiveProfile(profileId);
-        repo.insertBackup({ kind: 'original', label: 'Account as it was at setup', stremioUserId: user.id, snapshot });
+      const accountId = await this.db.transaction(async (tx) => {
+        const now = this.now();
+        const row = await tx.get(
+          `INSERT INTO accounts (stremio_user_id, stremio_email, auth_key_enc, addon_token, enc_version, created_at, last_login_at)
+           VALUES ($1, $2, '\\x00', $3, 2, $4, $5) RETURNING id`,
+          [user.id, user.email, (await import('../crypto.js')).randomToken(), now, now]
+        );
+        const id = Number(row.id);
+        const repo = new AccountRepo(tx, this.cipher, id, this.now);
+        await tx.run('UPDATE accounts SET auth_key_enc = $1 WHERE id = $2',
+          [repo.cipher.encryptJson(authKey, 'authkey'), id]);
+        const profileId = await repo.insertProfile({ name: 'Original', avatarPreset: 'initial', avatarColour: DEFAULT_COLOUR, stremioUserId: user.id, snapshot });
+        await repo.setActiveProfile(profileId);
+        await repo.insertBackup({ kind: 'original', label: 'Account as it was at setup', stremioUserId: user.id, snapshot });
         // The first account ever set up runs the server.
-        this.db.prepare("INSERT INTO meta (key, value) VALUES ('owner_stremio_user_id', ?) ON CONFLICT (key) DO NOTHING").run(user.id);
+        await tx.run("INSERT INTO meta (key, value) VALUES ('owner_stremio_user_id', $1) ON CONFLICT (key) DO NOTHING", [user.id]);
         return id;
-      })();
+      });
       await this.replaceStaleAddon(accountId, authKey, live.addons);
-      this.forAccount(accountId).repo.logActivity('signin', 'Account set up: your Stremio account was saved as "Original"');
+      await this.forAccount(accountId).repo.logActivity('signin', 'Account set up: your Stremio account was saved as "Original"');
       this.log.info('Account created', { accountId, libraryItems: snapshot.library.length, addons: snapshot.addons.length });
       return { accountId, created: true, warnings };
     });
@@ -162,11 +171,13 @@ export class AccountsService {
    */
   async replaceStaleAddon(accountId, authKey, addons) {
     const service = this.forAccount(accountId);
-    const { addon_token: token, active_profile_id: profileId } = service.repo.getState();
+    const state = await service.repo.getState();
+    const token = state?.addon_token;
+    const profileId = state?.active_profile_id;
     let list = addons;
     if (this.selfAddon && addons.some((a) => this.selfAddon.isStale(a, token))) {
       try {
-        const next = service.prepareAddons(addons, profileId);
+        const next = service.prepareAddons(addons, profileId, token);
         await this.stremio.setAddons(authKey, next);
         list = next;
         this.log.info("Pointed an old copy of the add-on at the new account's link", { accountId });
@@ -174,7 +185,7 @@ export class AccountsService {
         this.log.warn("Couldn't point an old copy of the add-on at the new account's link", { accountId, error: err.message });
       }
     }
-    service.noteAddons(list);
+    await service.noteAddons(list);
   }
 
   /**
@@ -184,7 +195,7 @@ export class AccountsService {
   async deleteAccount(accountId, { reason = null } = {}) {
     const service = this.forAccount(accountId);
     await service.lock.run(async () => {
-      this.accounts.delete(accountId);
+      await this.accounts.delete(accountId);
     });
     this.services.delete(accountId);
     this.log.info('Account deleted', { accountId, ...(reason ? { reason } : {}) });
@@ -192,7 +203,7 @@ export class AccountsService {
 
   /** Stremio asked this account's add-on for something: it counts as used. */
   noteAddonUse(accountId) {
-    this.accounts.touchAddon(accountId);
+    this.accounts.touchAddon(accountId).catch(() => {});
   }
 
   /**
@@ -202,10 +213,15 @@ export class AccountsService {
    * removed, and how many more are due (left for the next run by the limit).
    */
   async removeUnused(since, { limit = Infinity } = {}) {
-    const due = this.accounts.unusedSince(since).filter((id) => !this.isAdmin(id));
+    const allUnused = await this.accounts.unusedSince(since);
+    const due = [];
+    for (const id of allUnused) {
+      if (!(await this.isAdmin(id))) due.push(id);
+    }
     let removed = 0;
     for (const id of due.slice(0, limit)) {
-      if (!this.accounts.unusedSince(since).includes(id)) continue;
+      const stillUnused = await this.accounts.unusedSince(since);
+      if (!stillUnused.includes(id)) continue;
       await this.deleteAccount(id, { reason: 'unused' });
       removed++;
     }

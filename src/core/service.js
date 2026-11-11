@@ -169,61 +169,62 @@ export class ProfilesService {
   }
 
   /** `addons` with OpenProfiles in place, as profile `profileId`'s list (its catalog id names the profile). */
-  prepareAddons(addons, profileId) {
+  async prepareAddons(addons, profileId, token = null) {
     if (!this.selfAddon) return addons;
-    return ensureSelfAddon(addons, this.selfAddon.descriptor(this.repo.getState().addon_token, profileId));
+    const t = token ?? (await this.repo.getState())?.addon_token;
+    return ensureSelfAddon(addons, this.selfAddon.descriptor(t, profileId));
   }
 
   /** Installed means this account's link: a copy with an old one (e.g. a removed account's) doesn't count. */
-  noteAddons(addons) {
-    const state = this.repo.getState();
-    if (this.selfAddon && state) this.repo.setAddonInstalled(addons.some((a) => hasToken(a, state.addon_token)));
+  async noteAddons(addons) {
+    const state = await this.repo.getState();
+    if (this.selfAddon && state) await this.repo.setAddonInstalled(addons.some((a) => hasToken(a, state.addon_token)));
   }
 
   // ── read-only views ──────────────────────────────────────────────────────
 
-  status() {
-    const account = this.repo.getAccount();
-    const state = this.repo.getState();
+  async status() {
+    const account = await this.repo.getAccount();
+    const state = await this.repo.getState();
     return {
       linked: Boolean(account),
       account: account && { email: account.stremio_email, userId: account.stremio_user_id, linkedAt: account.linked_at },
       activeProfileId: state?.active_profile_id ?? null,
       addonToken: state?.addon_token ?? null,
-      profiles: this.repo.listProfiles(),
-      openJournal: this.describeJournal(this.repo.getOpenJournal()),
+      profiles: await this.repo.listProfiles(),
+      openJournal: await this.describeJournal(await this.repo.getOpenJournal()),
       busy: this.lock.busy,
     };
   }
 
-  describeJournal(j) {
+  async describeJournal(j) {
     if (!j) return null;
-    const name = (id) => this.repo.getProfile(id)?.name ?? '(deleted profile)';
+    const name = async (id) => (await this.repo.getProfile(id))?.name ?? "(deleted profile)";
     return {
       ...j,
-      fromName: j.from_profile_id != null ? name(j.from_profile_id) : null,
-      toName: j.to_profile_id != null ? name(j.to_profile_id) : null,
-      targetBackup: j.target_backup_id != null ? this.repo.getBackup(j.target_backup_id) : null,
+      fromName: j.from_profile_id != null ? await name(j.from_profile_id) : null,
+      toName: j.to_profile_id != null ? await name(j.to_profile_id) : null,
+      targetBackup: j.target_backup_id != null ? await this.repo.getBackup(j.target_backup_id) : null,
     };
   }
 
-  listBackups() {
-    return this.repo.listBackups();
+  async listBackups() {
+    return await this.repo.listBackups();
   }
 
-  recentActivity(limit = 10) {
-    return this.repo.recentJournal(limit);
+  async recentActivity(limit = 10) {
+    return await this.repo.recentJournal(limit);
   }
 
-  getBackup(id) {
-    return this.repo.getBackup(id);
+  async getBackup(id) {
+    return await this.repo.getBackup(id);
   }
 
   // ── the in-Stremio add-on ────────────────────────────────────────────────
 
   /** Install links and whether the add-on was in the account's list at the last read. */
-  addonInfo() {
-    const state = this.repo.getState();
+  async addonInfo() {
+    const state = await this.repo.getState();
     if (!state || !this.selfAddon) return null;
     const manifestUrl = this.selfAddon.manifestUrl(state.addon_token);
     return {
@@ -239,20 +240,21 @@ export class ProfilesService {
    */
   rotateAddonToken() {
     return this.lock.run(async () => {
-      this.requireAccount();
-      this.assertNoOpenJournal();
+      await this.requireAccount();
+      await this.assertNoOpenJournal();
       const { authKey } = await this.session();
       const token = randomToken();
       let addons = await this.stremio.getAddons(authKey);
       if (addons.some(isSelfAddon)) {
-        addons = ensureSelfAddon(addons, this.selfAddon.descriptor(token, this.repo.getState()?.active_profile_id));
+        const state = await this.repo.getState();
+        addons = ensureSelfAddon(addons, this.selfAddon.descriptor(token, state?.active_profile_id));
         await this.stremio.setAddons(authKey, addons);
       }
-      this.repo.setAddonToken(token);
-      this.noteAddons(addons);
-      this.repo.logActivity('addon-link', 'Made a new add-on link');
-      this.log.info('Add-on link rotated');
-      return this.addonInfo();
+      await this.repo.setAddonToken(token);
+      await this.noteAddons(addons);
+      await this.repo.logActivity("addon-link", "Made a new add-on link");
+      this.log.info("Add-on link rotated");
+      return await this.addonInfo();
     });
   }
 
@@ -273,17 +275,15 @@ export class ProfilesService {
     addonRefs = null, addonUrl = null, renames = {}, cinemeta = null, switchNow = false,
   }) {
     return this.lock.run(async () => {
-      const account = this.requireAccount();
+      const account = await this.requireAccount();
       const clean = this.validateName(name);
       this.validateColour(colour);
-      // A new profile has no photo yet: that's uploaded on its Picture section afterwards.
       if (!isValidAvatar(picture) || isPhoto(picture)) throw new UserError('BAD_INPUT', 'Pick one of the listed pictures.');
-      this.assertNameFree(clean);
-      this.assertRoomForProfile();
-      this.assertNoOpenJournal();
+      await this.assertNameFree(clean);
+      await this.assertRoomForProfile();
+      await this.assertNoOpenJournal();
       const { authKey } = await this.session();
-      const activeId = this.repo.getState()?.active_profile_id;
-      // The profile in use is newest in Stremio, so copying it means copying the account.
+      const activeId = (await this.repo.getState())?.active_profile_id;
       const start = from === 'profile' && sourceProfileId === activeId ? 'current' : from;
 
       let snapshot;
@@ -291,15 +291,15 @@ export class ProfilesService {
       if (start === 'current') {
         live = await this.readLive(authKey);
         this.checkLiveSize(live);
-        snapshot = this.profileCopy(this.capture(live));
+        snapshot = await this.profileCopy(this.capture(live));
       } else if (start === 'empty') {
         const addons = await this.stremio.getAddons(authKey);
-        this.noteAddons(addons);
+        await this.noteAddons(addons);
         this.checkLiveSize({ library: [], addons });
         live = { addons };
         snapshot = { library: [], addons, notifs: [] };
       } else if (start === 'profile') {
-        const source = this.repo.getProfileRow(Number(sourceProfileId));
+        const source = await this.repo.getProfileRow(Number(sourceProfileId));
         if (!source) throw new UserError('NOT_FOUND', 'The profile to copy no longer exists.');
         this.assertAnchor(source, account, source.name);
         snapshot = { ...decodeSnapshot(this.repo.cipher, source, source.name) };
@@ -310,7 +310,7 @@ export class ProfilesService {
       const warnings = [];
       if (addonRefs || addonUrl) {
         const liveAddons = live?.addons ?? await this.stremio.getAddons(authKey);
-        const pool = addonPool([{ addons: snapshot.addons }, { addons: liveAddons }, ...this.savedAddonLists()]);
+        const pool = addonPool([{ addons: snapshot.addons }, { addons: liveAddons }, ...(await this.savedAddonLists())]);
         const lookup = (ref) => pool.get(ref)?.addon ?? this.stashedAddon(ref);
         const { addons, missing } = listFromRefs(addonRefs ?? snapshot.addons.map(addonRef), lookup, renames);
         if (missing.length) throw new UserError('ADDON_GONE', "An add-on you picked isn't available any more. Go back to the add-ons step and pick again.");
@@ -327,9 +327,9 @@ export class ProfilesService {
       }
       checkAddons(snapshot.addons, clean);
 
-      this.assertNameFree(clean);
-      const id = this.repo.insertProfile({ name: clean, avatarPreset: picture, avatarColour: colour, stremioUserId: account.stremio_user_id, snapshot });
-      this.repo.logActivity('profile', `Created "${clean}"`);
+      await this.assertNameFree(clean);
+      const id = await this.repo.insertProfile({ name: clean, avatarPreset: picture, avatarColour: colour, stremioUserId: account.stremio_user_id, snapshot });
+      await this.repo.logActivity('profile', `Created "${clean}"`);
       let switched = null;
       if (switchNow) {
         try {
@@ -339,7 +339,7 @@ export class ProfilesService {
           warnings.push(`"${clean}" was created, but switching to it didn't work: ${userMessageOf(err)}`);
         }
       }
-      return Object.assign(this.repo.getProfile(id), { warnings, switched });
+      return Object.assign(await this.repo.getProfile(id), { warnings, switched });
     });
   }
 
@@ -349,18 +349,18 @@ export class ProfilesService {
    * which of them are ticked and how Cinemeta is set.
    */
   async wizardOptions() {
-    this.requireAccount();
+    await this.requireAccount();
     const { authKey } = await this.session();
     const live = await this.stremio.getAddons(authKey);
-    this.noteAddons(live);
-    const activeId = this.repo.getState()?.active_profile_id;
-    const active = activeId != null ? this.repo.getProfile(activeId) : null;
-    const saved = this.savedAddonLists({ skip: activeId });
+    await this.noteAddons(live);
+    const activeId = (await this.repo.getState())?.active_profile_id;
+    const active = activeId != null ? await this.repo.getProfile(activeId) : null;
+    const saved = await this.savedAddonLists({ skip: activeId });
     const pool = addonPool([{ label: active?.name ?? 'Stremio now', addons: live }, ...saved]);
     const startOf = (addons) => ({ refs: addons.map(addonRef), cinemeta: cinemetaOf(addons) });
     return {
       activeName: active?.name ?? null,
-      room: this.repo.countProfiles() < MAX_PROFILES,
+      room: (await this.repo.countProfiles()) < MAX_PROFILES,
       pool: [...pool.values()].map(({ addon, from }) => ({ ...describeAddon(addon), from })),
       starts: {
         live: startOf(live),
@@ -370,12 +370,12 @@ export class ProfilesService {
   }
 
   /** Every readable profile's saved add-on list, `{ id, label, addons }`. */
-  savedAddonLists({ skip = null } = {}) {
+  async savedAddonLists({ skip = null } = {}) {
     const out = [];
-    for (const p of this.repo.listProfiles()) {
+    for (const p of await this.repo.listProfiles()) {
       if (p.id === skip) continue;
       try {
-        out.push({ id: p.id, label: p.name, addons: this.savedSnapshot(p.id).addons });
+        out.push({ id: p.id, label: p.name, addons: (await this.savedSnapshot(p.id)).addons });
       } catch (err) {
         if (!(err instanceof GuardError)) throw err;
       }
@@ -384,24 +384,24 @@ export class ProfilesService {
   }
 
   /** A profile's saved library, add-ons and notifications, checked. */
-  savedSnapshot(profileId) {
-    const row = this.repo.getProfileRow(profileId);
+  async savedSnapshot(profileId) {
+    const row = await this.repo.getProfileRow(profileId);
     if (!row) throw new UserError('NOT_FOUND', 'That profile no longer exists.');
     return decodeSnapshot(this.repo.cipher, row, row.name);
   }
 
   /** What the profile page shows about one profile. Unreadable saved state shows as null. */
-  profileDetails(profileId) {
-    const profile = this.requireProfile(profileId);
+  async profileDetails(profileId) {
+    const profile = await this.requireProfile(profileId);
     let saved = null;
     try {
-      saved = this.savedSnapshot(profileId);
+      saved = await this.savedSnapshot(profileId);
     } catch (err) {
       if (!(err instanceof GuardError)) throw err;
     }
     return {
       profile,
-      active: this.repo.getState()?.active_profile_id === profileId,
+      active: (await this.repo.getState())?.active_profile_id === profileId,
       addons: saved ? saved.addons.map(describeAddon) : null,
       cinemeta: saved ? cinemetaOf(saved.addons) : null,
       continueWatching: saved ? countContinueWatching(saved.library) : null,
@@ -416,15 +416,15 @@ export class ProfilesService {
    * it, so a save can tell if it changed meanwhile.
    */
   async editableAddons(profileId) {
-    const profile = this.requireProfile(profileId);
-    const active = this.repo.getState()?.active_profile_id === profileId;
+    const profile = await this.requireProfile(profileId);
+    const active = (await this.repo.getState())?.active_profile_id === profileId;
     let addons;
     if (active) {
       const { authKey } = await this.session();
       addons = await this.stremio.getAddons(authKey);
-      this.noteAddons(addons);
+      await this.noteAddons(addons);
     } else {
-      addons = this.savedSnapshot(profileId).addons;
+      addons = (await this.savedSnapshot(profileId)).addons;
     }
     return { profile, active, addons, base: addonsHash(addons) };
   }
@@ -433,7 +433,7 @@ export class ProfilesService {
   async addonManager(profileId) {
     const { profile, active, addons, base } = await this.editableAddons(profileId);
     const own = new Set(addons.map(addonRef));
-    const others = addonPool(this.savedAddonLists({ skip: profileId }));
+    const others = addonPool(await this.savedAddonLists({ skip: profileId }));
     const { index, wrapped, wrappedIndex } = findCinemeta(addons);
     const nameOf = (a) => String(a.manifest?.name || a.manifest?.id || 'Another add-on');
     // With nothing covering IMDb ids (a TMDB-ids-only setup), the own-ids add-on is the source.
@@ -478,7 +478,7 @@ export class ProfilesService {
       editKind: 'addons',
       label: (p) => `Before editing ${p.name}'s add-ons`,
       change: async (current, profile) => {
-        const others = addonPool(this.savedAddonLists({ skip: profileId }));
+        const others = addonPool(await this.savedAddonLists({ skip: profileId }));
         const lookup = (ref) => current.find((a) => addonRef(a) === ref) ?? others.get(ref)?.addon ?? this.stashedAddon(ref);
         const { addons, missing } = listFromRefs(addRef ? [...refs, addRef] : refs, lookup, renames);
         if (missing.length) throw new UserError('ADDON_GONE', "An add-on in the list isn't available any more. Reload the page and try again.");
@@ -648,10 +648,10 @@ export class ProfilesService {
   }
 
   async doEditAddons(profileId, { base, editKind, label, change }) {
-    const account = this.requireAccount();
-    this.assertNoOpenJournal();
-    const profile = this.requireProfile(profileId);
-    const active = this.repo.getState()?.active_profile_id === profileId;
+    const account = await this.requireAccount();
+    await this.assertNoOpenJournal();
+    const profile = await this.requireProfile(profileId);
+    const active = (await this.repo.getState())?.active_profile_id === profileId;
     let authKey = null;
     let live = null;
     let current;
@@ -661,7 +661,7 @@ export class ProfilesService {
       this.checkLiveSize(live);
       current = live.addons;
     } else {
-      current = this.savedSnapshot(profileId).addons;
+      current = (await this.savedSnapshot(profileId)).addons;
     }
     if (base != null && addonsHash(current) !== base) {
       throw new UserError('CHANGED', `${profile.name}'s add-ons changed since this page was opened${active ? ' (in Stremio)' : ''}. Nothing was saved: reload the page and make the change again.`);
@@ -669,38 +669,36 @@ export class ProfilesService {
 
     const { addons: wanted, activity, warnings = [], noChange = false } = await change(current, profile);
     if (noChange) return { changed: false, warnings: [], active, profile };
-    const next = this.prepareAddons(wanted, profileId);
+    const next = await this.prepareAddons(wanted, profileId);
     checkAddons(next, profile.name);
     if (JSON.stringify(next) === JSON.stringify(current)) return { changed: false, warnings: [], active, profile };
 
     const backupId = active
-      ? this.repo.insertBackup({ kind: 'pre_change', label: label(profile), stremioUserId: account.stremio_user_id, snapshot: this.capture(live), profileId, editKind })
-      : this.backupProfileBeforeChange(profileId, label(profile), editKind);
+      ? await this.repo.insertBackup({ kind: 'pre_change', label: label(profile), stremioUserId: account.stremio_user_id, snapshot: this.capture(live), profileId, editKind })
+      : await this.backupProfileBeforeChange(profileId, label(profile), editKind);
     if (active) {
       try {
         await this.stremio.setAddons(authKey, next);
       } catch (err) {
-        // Unreachable means no answer: Stremio may still have applied it, so the backup
-        // of the old list stays. Any other error is a definite no.
         if (err.kind === 'unreachable') {
-          throw new UserError('WRITE_UNKNOWN', `Stremio didn't answer, so the new add-on list may or may not have been saved there. The list from before was backed up; reload the page to see which one Stremio has.`, { cause: err });
+          throw new UserError('WRITE_UNKNOWN', "Stremio didn't answer, so the new add-on list may or may not have been saved there. The list from before was backed up; reload the page to see which one Stremio has.", { cause: err });
         }
-        this.repo.deleteBackup(backupId);
+        await this.repo.deleteBackup(backupId);
         throw new UserError('WRITE_FAILED', `Stremio didn't take the new add-on list, so nothing changed: ${userMessageOf(err)}`, { cause: err });
       }
-      this.noteAddons(next);
+      await this.noteAddons(next);
     }
-    this.repo.setAfterHash(backupId, addonsFingerprint(next));
-    this.repo.saveProfileAddons(profileId, next);
-    this.repo.pruneBackups();
-    this.repo.logActivity('edit', activity);
+    await this.repo.setAfterHash(backupId, addonsFingerprint(next));
+    await this.repo.saveProfileAddons(profileId, next);
+    await this.repo.pruneBackups();
+    await this.repo.logActivity('edit', activity);
     this.log.info('Add-ons edited', { profileId, editKind, live: active });
     return { changed: true, backupId, warnings, active, profile };
   }
 
   /** The newest add-on or Cinemeta edit of the last 24 hours that can still be undone, or null. */
-  latestUndo() {
-    return this.repo.latestUndoableEdit(this.now() - UNDO_MS);
+  async latestUndo() {
+    return await this.repo.latestUndoableEdit(this.now() - UNDO_MS);
   }
 
   /**
@@ -710,16 +708,16 @@ export class ProfilesService {
    */
   undoEdit(backupId) {
     return this.lock.run(async () => {
-      const account = this.requireAccount();
-      const row = this.repo.getBackupRow(backupId);
+      const account = await this.requireAccount();
+      const row = await this.repo.getBackupRow(backupId);
       if (!row || row.kind !== 'pre_change' || !['addons', 'cinemeta'].includes(row.edit_kind) || row.undone_at != null) {
         throw new UserError('NOT_FOUND', "That edit can't be undone any more.");
       }
-      // Only the newest edit, within the undo window: an older one would also throw away the ones after it.
-      if (this.latestUndo()?.id !== row.id) {
+      const latest = await this.latestUndo();
+      if (latest?.id !== row.id) {
         throw new UserError('NOT_LATEST', "Only the latest edit can be undone here. To go back further, restore its backup on the Backups tab.");
       }
-      if (row.profile_id == null || !this.repo.getProfile(row.profile_id)) {
+      if (row.profile_id == null || !(await this.repo.getProfile(row.profile_id))) {
         throw new UserError('NOT_FOUND', 'The profile that edit was made to no longer exists.');
       }
       this.assertAnchor(row, account, 'The backup taken before that edit');
@@ -735,7 +733,7 @@ export class ProfilesService {
           return { addons, activity: `Undid an edit of ${profile.name}'s add-ons` };
         },
       });
-      this.repo.markUndone(backupId);
+      await this.repo.markUndone(backupId);
       return result;
     });
   }
@@ -747,10 +745,10 @@ export class ProfilesService {
    */
   restoreAddonsFromBackup(backupId) {
     return this.lock.run(async () => {
-      const account = this.requireAccount();
-      const row = this.repo.getBackupRow(backupId);
+      const account = await this.requireAccount();
+      const row = await this.repo.getBackupRow(backupId);
       if (!row || row.kind !== 'pre_change' || row.profile_id == null) throw new UserError('NOT_FOUND', "That backup can't put back add-ons on its own.");
-      if (!this.repo.getProfile(row.profile_id)) throw new UserError('NOT_FOUND', 'The profile that backup was taken of no longer exists. Restore the whole backup instead.');
+      if (!(await this.repo.getProfile(row.profile_id))) throw new UserError('NOT_FOUND', 'The profile that backup was taken of no longer exists. Restore the whole backup instead.');
       this.assertAnchor(row, account, 'This backup');
       const { addons } = decodeSnapshot(this.repo.cipher, row, 'This backup');
       const result = await this.doEditAddons(row.profile_id, {
@@ -759,7 +757,7 @@ export class ProfilesService {
         label: (p) => `Before putting back ${p.name}'s add-ons from a backup`,
         change: async (current, profile) => ({ addons, activity: `Put ${profile.name}'s add-ons back to "${row.label}"` }),
       });
-      if (row.edit_kind && row.undone_at == null) this.repo.markUndone(backupId);
+      if (row.edit_kind && row.undone_at == null) await this.repo.markUndone(backupId);
       return result;
     });
   }
@@ -827,117 +825,116 @@ export class ProfilesService {
     }
   }
 
-  renameProfile(id, name) {
-    const profile = this.requireProfile(id);
+  async renameProfile(id, name) {
+    const profile = await this.requireProfile(id);
     const clean = this.validateName(name);
-    if (clean.toLowerCase() !== profile.name.toLowerCase()) this.assertNameFree(clean);
-    this.repo.renameProfile(id, clean);
-    if (clean !== profile.name) this.repo.logActivity('profile', `Renamed "${profile.name}" to "${clean}"`);
+    if (clean.toLowerCase() !== profile.name.toLowerCase()) await this.assertNameFree(clean);
+    await this.repo.renameProfile(id, clean);
+    if (clean !== profile.name) await this.repo.logActivity('profile', `Renamed "${profile.name}" to "${clean}"`);
   }
 
   /** `picture` is an avatar preset (see addon/avatars.js); omitted keeps the current one. */
-  setAvatar(id, colour, picture) {
-    const profile = this.requireProfile(id);
+  async setAvatar(id, colour, picture) {
+    const profile = await this.requireProfile(id);
     this.validateColour(colour);
     const preset = picture ?? profile.avatar_preset;
     if (!isValidAvatar(preset)) throw new UserError('BAD_INPUT', 'Pick one of the listed pictures.');
-    // Only this profile's own photo, as it is now.
     if (isPhoto(preset) && preset !== photoPreset(profile.photo_hash)) {
       throw new UserError('BAD_INPUT', "That photo isn't this profile's any more. Reload the page and pick again.");
     }
-    this.repo.setProfileAvatar(id, preset, colour);
+    await this.repo.setProfileAvatar(id, preset, colour);
   }
 
   /**
    * The profile's own photo, already redrawn (art.js normalisePhoto), becomes
    * its picture. One per profile: a new upload replaces the old one.
    */
-  setPhoto(id, jpeg) {
-    const profile = this.requireProfile(id);
+  async setPhoto(id, jpeg) {
+    const profile = await this.requireProfile(id);
     const hash = photoHash(jpeg);
-    this.repo.transaction(() => {
-      this.repo.setProfilePhoto(id, jpeg, hash);
-      this.repo.setProfileAvatar(id, photoPreset(hash), profile.avatar_colour);
+    await this.repo.transaction(async () => {
+      await this.repo.setProfilePhoto(id, jpeg, hash);
+      await this.repo.setProfileAvatar(id, photoPreset(hash), profile.avatar_colour);
     });
-    this.repo.logActivity('profile', `New photo for "${profile.name}"`);
-    return this.repo.getProfile(id);
+    await this.repo.logActivity('profile', `New photo for "${profile.name}"`);
+    return await this.repo.getProfile(id);
   }
 
   /** Deletes the photo; a profile showing it goes back to its letter. */
-  removePhoto(id) {
-    const profile = this.requireProfile(id);
+  async removePhoto(id) {
+    const profile = await this.requireProfile(id);
     if (!profile.photo_hash) return profile;
-    this.repo.transaction(() => {
-      this.repo.setProfilePhoto(id, null);
-      if (isPhoto(profile.avatar_preset)) this.repo.setProfileAvatar(id, 'initial', profile.avatar_colour);
+    await this.repo.transaction(async () => {
+      await this.repo.setProfilePhoto(id, null);
+      if (isPhoto(profile.avatar_preset)) await this.repo.setProfileAvatar(id, 'initial', profile.avatar_colour);
     });
-    this.repo.logActivity('profile', `Removed the photo of "${profile.name}"`);
-    return this.repo.getProfile(id);
+    await this.repo.logActivity('profile', `Removed the photo of "${profile.name}"`);
+    return await this.repo.getProfile(id);
   }
 
   deleteProfile(id) {
     return this.lock.run(async () => {
-      const profile = this.requireProfile(id);
-      if (this.repo.getState()?.active_profile_id === id) {
+      const profile = await this.requireProfile(id);
+      if ((await this.repo.getState())?.active_profile_id === id) {
         throw new UserError('ACTIVE', `"${profile.name}" is the profile in use. Switch to another profile before deleting it.`);
       }
-      const open = this.repo.getOpenJournal();
+      const open = await this.repo.getOpenJournal();
       if (open && (open.from_profile_id === id || open.to_profile_id === id)) {
         throw new UserError('RECOVERY_NEEDED', 'An unfinished switch involves this profile. Resolve it first.');
       }
-      this.repo.moveProfileToBin(id);
-      this.repo.trimBin(BIN_MAX);
-      this.repo.logActivity('profile', `Deleted "${profile.name}" (in the bin for ${BIN_DAYS} days)`);
+      await this.repo.moveProfileToBin(id);
+      await this.repo.trimBin(BIN_MAX);
+      await this.repo.logActivity('profile', `Deleted "${profile.name}" (in the bin for ${BIN_DAYS} days)`);
       this.log.info('Profile moved to the bin', { profileId: id });
     });
   }
 
-  listBin() {
-    return this.repo.listBin().map((p) => ({ ...p, purgeAt: p.deleted_at + BIN_DAYS * DAY_MS }));
+  async listBin() {
+    return (await this.repo.listBin()).map((p) => ({ ...p, purgeAt: p.deleted_at + BIN_DAYS * DAY_MS }));
   }
 
   /** Bring a profile back from the bin. If its name was reused meanwhile, it comes back as "Name (restored)". */
   restoreFromBin(id) {
     return this.lock.run(async () => {
-      const profile = this.repo.getBinProfile(id);
+      const profile = await this.repo.getBinProfile(id);
       if (!profile) throw new UserError('NOT_FOUND', "That profile isn't in the bin any more.");
-      this.assertRoomForProfile();
+      await this.assertRoomForProfile();
       let name = profile.name;
-      if (this.nameTaken(name)) name = `${profile.name.slice(0, MAX_NAME_LENGTH - 11)} (restored)`;
-      if (this.nameTaken(name)) throw new UserError('NAME_TAKEN', `Rename "${name}" first, then bring this profile back.`);
-      this.repo.restoreProfileFromBin(id, name);
-      this.repo.logActivity('profile', `Brought "${name}" back from the bin`);
-      return this.repo.getProfile(id);
+      if (await this.nameTaken(name)) name = `${profile.name.slice(0, MAX_NAME_LENGTH - 11)} (restored)`;
+      if (await this.nameTaken(name)) throw new UserError('NAME_TAKEN', `Rename "${name}" first, then bring this profile back.`);
+      await this.repo.restoreProfileFromBin(id, name);
+      await this.repo.logActivity('profile', `Brought "${name}" back from the bin`);
+      return await this.repo.getProfile(id);
     });
   }
 
   /** Save the account's current state into the active profile. */
   saveNow() {
     return this.lock.run(async () => {
-      const account = this.requireAccount();
-      this.assertNoOpenJournal();
-      const activeId = this.repo.getState()?.active_profile_id;
-      const profile = activeId != null ? this.repo.getProfile(activeId) : null;
+      const account = await this.requireAccount();
+      await this.assertNoOpenJournal();
+      const activeId = (await this.repo.getState())?.active_profile_id;
+      const profile = activeId != null ? await this.repo.getProfile(activeId) : null;
       if (!profile) throw new UserError('NO_ACTIVE', 'No profile is active.');
       this.assertAnchor(profile, account, profile.name);
       const { authKey } = await this.session();
       const live = await this.readLive(authKey);
       this.checkLiveSize(live);
       this.assertPlausibleLive(live, profile);
-      // Another profile's title still playing on some device isn't this profile's to save.
-      const plan = this.planCarryovers(live.library, profile.id, [...this.followed(), ...this.strayRecords(live.library, profile.id)]);
-      const copy = this.profileCopy({ ...this.capture(live), library: plan.library });
+      const strays = await this.strayRecords(live.library, profile.id);
+      const plan = await this.planCarryovers(live.library, profile.id, [...(await this.followed()), ...strays]);
+      const copy = await this.profileCopy({ ...this.capture(live), library: plan.library });
       const now = this.now();
-      this.repo.transaction(() => {
-        this.repo.saveProfileSnapshot(profile.id, copy);
-        this.saveProgress(plan.progress);
-        this.repo.replaceCarryovers(plan.verdicts.flatMap(({ rec, v, item }) => {
+      await this.repo.transaction(async () => {
+        await this.repo.saveProfileSnapshot(profile.id, copy);
+        await this.saveProgress(plan.progress);
+        await this.repo.replaceCarryovers(plan.verdicts.flatMap(({ rec, v, item }) => {
           if (v.kind === 'released') return [];
           if (v.kind === 'untouched') return rec.expiresAt > now ? [rec] : [];
           return [seenMoving(rec, v.item, item, now)];
         }));
       });
-      return { profile: this.repo.getProfile(profile.id), notifsSaved: copy.notifs !== null };
+      return { profile: await this.repo.getProfile(profile.id), notifsSaved: copy.notifs !== null };
     });
   }
 
@@ -950,16 +947,16 @@ export class ProfilesService {
    */
   setPasscode(id, { code = null, current = null, fresh = false } = {}) {
     return this.lock.run(async () => {
-      const profile = this.requireProfile(id);
+      const profile = await this.requireProfile(id);
       if (code !== null && !isPasscode(code)) throw new UserError('BAD_PASSCODE', 'A passcode is 4 digits.');
       const had = Boolean(profile.has_passcode);
       if (!had && code === null) return { profile, kind: null };
       if (had && !fresh) await this.verifyPasscode(profile, current);
-      this.repo.setPasscodeHash(id, code === null ? null : await hashPasscode(code));
+      await this.repo.setPasscodeHash(id, code === null ? null : await hashPasscode(code));
       const kind = code === null ? 'remove' : had ? 'change' : 'set';
       const detail = { set: `Locked "${profile.name}" with a passcode`, change: `Changed the passcode of "${profile.name}"`, remove: `Removed the passcode of "${profile.name}"` }[kind];
-      this.repo.logActivity('passcode', had && fresh ? `${detail} (after signing in again)` : detail);
-      return { profile: this.repo.getProfile(id), kind };
+      await this.repo.logActivity('passcode', had && fresh ? `${detail} (after signing in again)` : detail);
+      return { profile: await this.repo.getProfile(id), kind };
     });
   }
 
@@ -978,14 +975,14 @@ export class ProfilesService {
     }
     if (!code) throw new UserError('PASSCODE_NEEDED', `Enter ${profile.name}'s passcode.`);
     if (!isPasscode(code)) throw new UserError('BAD_PASSCODE', 'A passcode is 4 digits.');
-    if (await checkPasscode(code, this.repo.getPasscodeHash(profile.id))) {
+    if (await checkPasscode(code, await this.repo.getPasscodeHash(profile.id))) {
       this.wrongCodes = { count: 0, until: 0 };
       return;
     }
     if (++this.wrongCodes.count < MAX_WRONG_CODES) throw new UserError('WRONG_PASSCODE', "That passcode isn't right.");
     const minutes = WRONG_CODE_WAIT_MS / 60000;
     this.wrongCodes = { count: 0, until: now + WRONG_CODE_WAIT_MS };
-    this.repo.logActivity('passcode', `${MAX_WRONG_CODES} wrong passcodes in a row: passcodes refused for ${minutes} minutes`);
+    await this.repo.logActivity('passcode', `${MAX_WRONG_CODES} wrong passcodes in a row: passcodes refused for ${minutes} minutes`);
     this.log.info('Wrong passcodes; refusing them for a while', { accountId: this.repo.accountId });
     throw new UserError('PASSCODE_WAIT', `That passcode isn't right either. After ${MAX_WRONG_CODES} wrong ones in a row, wait ${minutes} minutes before trying again.`);
   }
@@ -1001,88 +998,73 @@ export class ProfilesService {
   }
 
   async doSwitch(profileId, { passcode = null, via = 'web' } = {}) {
-    const account = this.requireAccount();
-    const state = this.repo.getState();
-    const target = this.repo.getProfileRow(profileId);
+    const account = await this.requireAccount();
+    const state = await this.repo.getState();
+    const target = await this.repo.getProfileRow(profileId);
     if (!target) throw new UserError('NOT_FOUND', 'That profile no longer exists.');
 
-    // 1. A half-finished switch comes first, so it isn't hidden behind "already in use".
-    this.assertNoOpenJournal();
-    // Idempotent: Stremio can request the stream more than once. The profile in use needs no code.
+    await this.assertNoOpenJournal();
     if (state.active_profile_id === profileId) {
-      return { alreadyActive: true, profile: this.repo.getProfile(profileId), warnings: [] };
+      return { alreadyActive: true, profile: await this.repo.getProfile(profileId), warnings: [] };
     }
-    // A locked profile asks for its code every time (switching away from one never does).
     if (target.passcode_hash) {
       await this.verifyPasscode(target, passcode);
-      this.repo.logActivity('unlock', `Unlocked "${target.name}" ${via === 'stremio' ? 'from Stremio' : 'on the web page'}`);
+      await this.repo.logActivity('unlock', `Unlocked "${target.name}" ${via === 'stremio' ? 'from Stremio' : 'on the web page'}`);
     }
 
-    // 2-4. Valid sign-in, same account, target decodes cleanly. No writes yet.
     const { authKey } = await this.session();
     this.assertAnchor(target, account, target.name);
     const targetSnap = decodeSnapshot(this.repo.cipher, target, target.name);
 
-    // 5. Live state. Library or add-on read failure aborts; notifications may be null.
     const live = await this.readLive(authKey);
     this.checkLiveSize(live);
     const captured = this.capture(live);
-    const outgoing = state.active_profile_id != null ? this.repo.getProfile(state.active_profile_id) : null;
+    const outgoing = state.active_profile_id != null ? await this.repo.getProfile(state.active_profile_id) : null;
     this.assertPlausibleLive(live, outgoing);
 
-    // Titles another profile kept playing on some device go back to that profile instead of
-    // into the outgoing one, with any the last switch couldn't follow yet. Those still playing,
-    // and the outgoing profile's own, are followed.
-    const strays = this.strayRecords(live.library, outgoing?.id ?? null);
-    const plan = this.planCarryovers(live.library, outgoing?.id ?? null, [...this.followed(), ...strays]);
+    const strays = await this.strayRecords(live.library, outgoing?.id ?? null);
+    const plan = await this.planCarryovers(live.library, outgoing?.id ?? null, [...(await this.followed()), ...strays]);
     const targetProgress = plan.progress.get(profileId);
     if (targetProgress) targetSnap.library = withProgress(targetSnap.library, targetProgress) ?? targetSnap.library;
     const follow = this.nextFollowed(plan, outgoing?.id ?? null, profileId);
 
-    // 6-7. Backup, save the outgoing profile and open the journal, all or nothing.
-    const journalId = this.repo.transaction(() => {
-      const backupId = this.repo.insertBackup({
+    const journalId = await this.repo.transaction(async () => {
+      const backupId = await this.repo.insertBackup({
         kind: 'pre_switch',
         label: `Before switching from ${outgoing ? `"${outgoing.name}"` : '(none)'} to "${target.name}"`,
         stremioUserId: account.stremio_user_id,
         snapshot: captured,
       });
-      if (outgoing) this.repo.saveProfileSnapshot(outgoing.id, this.profileCopy({ ...captured, library: plan.library }));
-      this.saveProgress(plan.progress);
-      return this.repo.startJournal({ kind: 'switch', fromProfileId: outgoing?.id ?? null, toProfileId: profileId, rollbackBackupId: backupId });
+      if (outgoing) await this.repo.saveProfileSnapshot(outgoing.id, await this.profileCopy({ ...captured, library: plan.library }));
+      await this.saveProgress(plan.progress);
+      return await this.repo.startJournal({ kind: 'switch', fromProfileId: outgoing?.id ?? null, toProfileId: profileId, rollbackBackupId: backupId });
     });
     this.log.info('Switch started', { journalId, from: outgoing?.id ?? null, to: profileId });
 
-    // 8-10. Write to Stremio. A device's save stamped after this was made after the switch.
     const switchAt = this.now();
     const { written, ...result } = await this.applyOrFail('switch', journalId, authKey, live, targetSnap, profileId,
       new Set(follow.map((r) => r.base._id)));
 
-    // 11. Flip the pointer.
-    this.repo.transaction(() => {
-      this.repo.setActiveProfile(profileId);
-      this.repo.closeJournal(journalId, 'finished', result.warnings);
-      // A title the switch left as it was is still what Stremio has. One the profile switched to
-      // has watched itself isn't followed: playing it from now on may well be that profile.
-      this.repo.replaceCarryovers(follow
+    await this.repo.transaction(async () => {
+      await this.repo.setActiveProfile(profileId);
+      await this.repo.closeJournal(journalId, 'finished', result.warnings);
+      await this.repo.replaceCarryovers(follow
         .map((r) => ({ ...r, written: written.get(r.base._id) ?? plan.liveById.get(r.base._id), putMtime: null }))
         .filter((r) => r.written && !hasOwnProgress(r.written)));
-      // A few minutes on, the whole library is looked over once for titles playing before this
-      // switch that Stremio hadn't heard of yet (strayRecords).
-      this.repo.setSweep(outgoing ? { switchAt, fromProfileId: outgoing.id, toProfileId: profileId } : null);
+      await this.repo.setSweep(outgoing ? { switchAt, fromProfileId: outgoing.id, toProfileId: profileId } : null);
     });
-    this.repo.pruneBackups();
-    this.repo.logActivity('switch', `Switched from ${outgoing ? `"${outgoing.name}"` : '(none)'} to "${target.name}"`);
-    this.logProgressMoved(plan.progress.keys());
+    await this.repo.pruneBackups();
+    await this.repo.logActivity('switch', `Switched from ${outgoing ? `"${outgoing.name}"` : '(none)'} to "${target.name}"`);
+    await this.logProgressMoved(plan.progress.keys());
     this.log.info('Switch finished', { journalId, ...result.library, warnings: result.warnings.length });
-    return { alreadyActive: false, profile: this.repo.getProfile(profileId), ...result };
+    return { alreadyActive: false, profile: await this.repo.getProfile(profileId), ...result };
   }
 
   async applyOrFail(what, journalId, authKey, live, target, profileId, track = null) {
     try {
       return await this.applySnapshot(journalId, authKey, live, target, profileId, track);
     } catch (err) {
-      this.repo.failJournal(journalId, userMessageOf(err));
+      await this.repo.failJournal(journalId, userMessageOf(err));
       this.log.error(`${what} interrupted`, { journalId, error: err.message });
       const verb = { switch: 'The switch', restore: 'The restore', rollback: 'Going back' }[what];
       throw new UserError('INTERRUPTED', `${verb} stopped partway: ${userMessageOf(err)} Open the OpenProfiles page to finish it or go back.`, { cause: err });
@@ -1103,19 +1085,19 @@ export class ProfilesService {
   async applySnapshot(journalId, authKey, live, target, profileId, track = null) {
     const warnings = [];
 
-    this.repo.setJournalPhase(journalId, 'library');
+    await this.repo.setJournalPhase(journalId, 'library');
     const library = target.library.filter((it) => !String(it._id).startsWith(ID_PREFIX));
     const lib = buildLibraryChanges(live.library, library, this.now());
     await this.putChunks(lib.changes, LIBRARY_CHUNK, (c) => this.stremio.putLibrary(authKey, c));
 
-    this.repo.setJournalPhase(journalId, 'addons');
-    const addons = this.prepareAddons(target.addons, profileId);
+    await this.repo.setJournalPhase(journalId, 'addons');
+    const addons = await this.prepareAddons(target.addons, profileId);
     if (JSON.stringify(addons) !== JSON.stringify(live.addons)) {
       await this.stremio.setAddons(authKey, addons);
-      this.noteAddons(addons);
+      await this.noteAddons(addons);
     }
 
-    this.repo.setJournalPhase(journalId, 'notifs');
+    await this.repo.setJournalPhase(journalId, 'notifs');
     let notifsSwapped = false;
     if (live.notifs === null) {
       warnings.push("Notifications weren't swapped: Stremio didn't return the current ones.");
@@ -1131,7 +1113,7 @@ export class ProfilesService {
         this.log.warn('Notification write failed', { journalId, error: err.message });
       }
     }
-    this.repo.setNotifsForeign(!notifsSwapped);
+    await this.repo.setNotifsForeign(!notifsSwapped);
     const result = { library: lib.stats, warnings };
     if (track) result.written = new Map(lib.changes.filter((c) => track.has(c._id)).map((c) => [c._id, c]));
     return result;
@@ -1148,9 +1130,9 @@ export class ProfilesService {
   // ── titles still playing elsewhere after a switch (core/carryover.js) ────
 
   /** The followed titles. Unreadable records are let go rather than block a switch. */
-  followed() {
+  async followed() {
     try {
-      return this.repo.listCarryovers();
+      return await this.repo.listCarryovers();
     } catch (err) {
       this.log.warn("Couldn't read the titles followed after a switch; letting them go", { error: err.message });
       return [];
@@ -1166,14 +1148,15 @@ export class ProfilesService {
    * owner in the bin still counts: its title leaves the profile in use all the
    * same, and the progress goes into its saved copy, there if it's restored.
    */
-  planCarryovers(library, activeId, records = this.followed()) {
+  async planCarryovers(library, activeId, records = null) {
+    if (!records) records = await this.followed();
     const liveById = new Map(library.filter(hasId).map((it) => [it._id, it]));
     const verdicts = [];
     const putBack = new Map();
     const progress = new Map();
     for (const rec of records) {
       const id = rec.ownerProfileId;
-      if (id === activeId || !(this.repo.getProfile(id) || this.repo.getBinProfile(id))) continue;
+      if (id === activeId || !(await this.repo.getProfile(id) || await this.repo.getBinProfile(id))) continue;
       const item = liveById.get(rec.base._id);
       const v = judge(rec, item);
       verdicts.push({ rec, v, item });
@@ -1217,12 +1200,12 @@ export class ProfilesService {
    * the profile switched from's, like any other. `[]` when the last switch
    * wasn't into `activeId`, or is too long ago for a position to prove anything.
    */
-  strayRecords(library, activeId) {
-    const sweep = this.repo.getSweep();
+  async strayRecords(library, activeId) {
+    const sweep = await this.repo.getSweep();
     const now = this.now();
     if (!sweep || sweep.toProfileId !== activeId || now - sweep.switchAt > IN_FLIGHT_MS) return [];
-    const ownerRow = this.repo.getProfileRow(sweep.fromProfileId);
-    const targetRow = this.repo.getProfileRow(activeId);
+    const ownerRow = await this.repo.getProfileRow(sweep.fromProfileId);
+    const targetRow = await this.repo.getProfileRow(activeId);
     if (!ownerRow || !targetRow) return [];
     let owner;
     let target;
@@ -1233,15 +1216,13 @@ export class ProfilesService {
       this.log.warn("Couldn't look over the last switch for titles still playing", { error: err.message });
       return [];
     }
-    const followed = new Set(this.followed().map((r) => r.base._id));
+    const followed = new Set((await this.followed()).map((r) => r.base._id));
     const at = new Date(sweep.switchAt).toISOString();
     const records = [];
     for (const item of library) {
       if (followed.has(item._id) || String(item._id).startsWith(ID_PREFIX)) continue;
       const mine = target.get(item._id);
       if (!startedBeforeSwitch(item, sweep.switchAt, mine)) continue;
-      // What the switch wrote: the target's copy, or the title hidden. The owner's copy carries
-      // the device's position, over the owner's own history of the title if it has one.
       const written = { ...(mine ?? tombstone(item, at)), _mtime: at };
       const theirs = owner.get(item._id);
       records.push({
@@ -1260,32 +1241,32 @@ export class ProfilesService {
   }
 
   /** Nothing is followed or looked over any more (a restore or recovery rewrote the account). */
-  stopFollowing() {
-    this.repo.replaceCarryovers([]);
-    this.repo.setSweep(null);
+  async stopFollowing() {
+    await this.repo.replaceCarryovers([]);
+    await this.repo.setSweep(null);
   }
 
   /**
    * Put owners' new progress into their saved copies (in the bin too), never
    * moving a title backwards, so saving the same progress twice changes nothing.
    */
-  saveProgress(progress) {
+  async saveProgress(progress) {
     for (const [ownerId, items] of progress) {
-      const row = this.repo.getProfileRow(ownerId) ?? this.repo.getBinProfileRow(ownerId);
+      const row = (await this.repo.getProfileRow(ownerId)) ?? (await this.repo.getBinProfileRow(ownerId));
       if (!row) continue;
       try {
         const next = withProgress(decodeSnapshot(this.repo.cipher, row, row.name).library, items);
-        if (next) this.repo.saveProfileLibrary(ownerId, next);
+        if (next) await this.repo.saveProfileLibrary(ownerId, next);
       } catch (err) {
         this.log.warn("Couldn't add progress made elsewhere to a profile's saved copy", { profileId: ownerId, error: err.message });
       }
     }
   }
 
-  logProgressMoved(ownerIds) {
+  async logProgressMoved(ownerIds) {
     for (const id of ownerIds) {
-      const name = this.repo.getProfile(id)?.name;
-      if (name) this.repo.logActivity('carryover', `Progress made on another device after a switch went back to "${name}"`);
+      const name = (await this.repo.getProfile(id))?.name;
+      if (name) await this.repo.logActivity('carryover', `Progress made on another device after a switch went back to "${name}"`);
     }
   }
 
@@ -1300,45 +1281,41 @@ export class ProfilesService {
   checkCarryovers() {
     return this.lock.run(async () => {
       const none = { following: 0, settled: 0 };
-      if (!this.repo.getAccount() || this.repo.getOpenJournal()) return none;
+      if (!(await this.repo.getAccount()) || (await this.repo.getOpenJournal())) return none;
       const now = this.now();
-      const activeId = this.repo.getState()?.active_profile_id ?? null;
-      // Once per switch, SWEEP_AFTER_MS on: the whole library, for titles playing before it that
-      // Stremio hadn't heard of yet. A network failure leaves it for the next round.
-      const sweep = this.repo.getSweep();
+      const activeId = (await this.repo.getState())?.active_profile_id ?? null;
+      const sweep = await this.repo.getSweep();
       if (sweep && now - sweep.switchAt >= SWEEP_AFTER_MS) {
         let strays = [];
         if (sweep.toProfileId === activeId) {
           try {
-            strays = this.strayRecords(await this.stremio.getLibrary(this.repo.getAuthKey()), activeId);
+            strays = await this.strayRecords(await this.stremio.getLibrary(await this.repo.getAuthKey()), activeId);
           } catch (err) {
             if (err.kind !== 'auth') throw err;
           }
         }
-        this.repo.transaction(() => {
-          this.repo.setSweep(null);
-          if (strays.length) this.repo.replaceCarryovers([...this.followed(), ...strays]);
+        await this.repo.transaction(async () => {
+          await this.repo.setSweep(null);
+          if (strays.length) await this.repo.replaceCarryovers([...(await this.followed()), ...strays]);
         });
       }
-      const records = this.followed().filter((r) => now < r.createdAt + MAX_MS && r.ownerProfileId !== activeId);
+      const records = (await this.followed()).filter((r) => now < r.createdAt + MAX_MS && r.ownerProfileId !== activeId);
       if (records.length === 0) {
-        this.repo.replaceCarryovers([]);
+        await this.repo.replaceCarryovers([]);
         return none;
       }
       let items;
       try {
-        items = await this.stremio.getLibraryItems(this.repo.getAuthKey(), [...new Set(records.map((r) => r.base._id))]);
+        items = await this.stremio.getLibraryItems(await this.repo.getAuthKey(), [...new Set(records.map((r) => r.base._id))]);
       } catch (err) {
-        // Signed out: keep following until the records expire. The next read that works (this
-        // check after signing in again, or a switch) sorts out what happened meanwhile.
         if (err.kind === 'auth') {
           const kept = records.filter((r) => r.expiresAt > now);
-          this.repo.replaceCarryovers(kept);
+          await this.repo.replaceCarryovers(kept);
           return { following: kept.length, settled: 0 };
         }
         throw err;
       }
-      const plan = this.planCarryovers(items, activeId, records);
+      const plan = await this.planCarryovers(items, activeId, records);
       const next = [];
       const settle = [];
       for (const { rec, v, item } of plan.verdicts) {
@@ -1354,24 +1331,20 @@ export class ProfilesService {
         }
       }
       if (settle.length === 0) {
-        this.repo.replaceCarryovers(next);
+        await this.repo.replaceCarryovers(next);
         return { following: next.length, settled: 0 };
       }
 
-      // Stremio keeps the copy with the newest _mtime, and a device whose clock runs ahead stamps
-      // its saves in the future: a put-back stamped with the server's time would be ignored.
       const at = this.now();
       const putBack = settle.map(({ rec, item }, i) => ({
         ...rec.written,
         _mtime: new Date(Math.max(at - i, timeOf(item._mtime) + 1)).toISOString(),
       }));
-      // The owners' progress is saved first, so a put-back that lands but whose answer is lost
-      // can't cost it: the next read takes the put-back (its _mtime) for untouched.
       const progress = new Map();
       for (const { rec, merged } of settle) progress.set(rec.ownerProfileId, [...(progress.get(rec.ownerProfileId) ?? []), merged]);
-      this.repo.transaction(() => {
-        this.saveProgress(progress);
-        this.repo.replaceCarryovers([...next, ...settle.map(({ rec, merged }, i) => ({ ...rec, base: merged, putMtime: putBack[i]._mtime }))]);
+      await this.repo.transaction(async () => {
+        await this.saveProgress(progress);
+        await this.repo.replaceCarryovers([...next, ...settle.map(({ rec, merged }, i) => ({ ...rec, base: merged, putMtime: putBack[i]._mtime }))]);
       });
       try {
         const { authKey } = await this.session({ spend: false });
@@ -1383,8 +1356,8 @@ export class ProfilesService {
       settle.forEach(({ rec, merged }, i) => {
         if (rec.expiresAt > now) next.push({ ...rec, base: merged, written: putBack[i], seenMtime: null, putMtime: null });
       });
-      this.repo.replaceCarryovers(next);
-      this.logProgressMoved(progress.keys());
+      await this.repo.replaceCarryovers(next);
+      await this.logProgressMoved(progress.keys());
       this.log.info('Titles played elsewhere after a switch went back to their profiles', { titles: putBack.length });
       return { following: next.length, settled: putBack.length };
     });
@@ -1395,10 +1368,10 @@ export class ProfilesService {
   /** Re-run the writes toward the interrupted operation's target. */
   finishInterrupted() {
     return this.lock.run(async () => {
-      const account = this.requireAccount();
-      const j = this.repo.getOpenJournal();
+      const account = await this.requireAccount();
+      const j = await this.repo.getOpenJournal();
       if (!j) throw new UserError('NOTHING_OPEN', 'There is no unfinished switch.');
-      const row = j.kind === 'switch' ? this.repo.getProfileRow(j.to_profile_id) : this.repo.getBackupRow(j.target_backup_id);
+      const row = j.kind === 'switch' ? await this.repo.getProfileRow(j.to_profile_id) : await this.repo.getBackupRow(j.target_backup_id);
       if (!row) throw new UserError('TARGET_GONE', "The interrupted switch's target no longer exists. Use \"Go back\" instead.");
       const label = j.kind === 'switch' ? row.name : 'The backup';
       const { authKey } = await this.session({ spend: false });
@@ -1406,16 +1379,14 @@ export class ProfilesService {
       const target = decodeSnapshot(this.repo.cipher, row, label);
       const live = await this.readLive(authKey);
       const result = await this.applyOrFail(j.kind, j.id, authKey, live, target, j.to_profile_id);
-      this.repo.transaction(() => {
-        if (j.kind === 'switch') this.repo.setActiveProfile(j.to_profile_id);
-        else this.repo.saveProfileSnapshot(j.to_profile_id, target);
-        this.repo.closeJournal(j.id, 'finished', result.warnings);
-        // A whole rewrite (this, going back, a restore) ends following titles played elsewhere:
-        // what a device did since can't be told apart from what was just written.
-        this.stopFollowing();
+      await this.repo.transaction(async () => {
+        if (j.kind === 'switch') await this.repo.setActiveProfile(j.to_profile_id);
+        else await this.repo.saveProfileSnapshot(j.to_profile_id, target);
+        await this.repo.closeJournal(j.id, 'finished', result.warnings);
+        await this.stopFollowing();
       });
-      this.repo.pruneBackups();
-      this.repo.logActivity('recovery', 'Finished an interrupted switch');
+      await this.repo.pruneBackups();
+      await this.repo.logActivity('recovery', 'Finished an interrupted switch');
       this.log.info('Interrupted operation finished', { journalId: j.id });
       return result;
     });
@@ -1424,23 +1395,21 @@ export class ProfilesService {
   /** Put the account back the way it was before the interrupted operation. */
   rollbackInterrupted() {
     return this.lock.run(async () => {
-      const account = this.requireAccount();
-      const j = this.repo.getOpenJournal();
+      const account = await this.requireAccount();
+      const j = await this.repo.getOpenJournal();
       if (!j) throw new UserError('NOTHING_OPEN', 'There is no unfinished switch.');
-      const row = j.rollback_backup_id != null ? this.repo.getBackupRow(j.rollback_backup_id) : null;
+      const row = j.rollback_backup_id != null ? await this.repo.getBackupRow(j.rollback_backup_id) : null;
       if (!row) throw new UserError('BACKUP_GONE', 'The backup taken before the switch is missing. Use "Finish" instead.');
       const { authKey } = await this.session({ spend: false });
       this.assertAnchor(row, account, 'The pre-switch backup');
       const snapshot = decodeSnapshot(this.repo.cipher, row, 'The pre-switch backup');
       const live = await this.readLive(authKey);
       const result = await this.applyOrFail('rollback', j.id, authKey, live, snapshot, j.from_profile_id);
-      // The pointer never moved and the outgoing profile was saved before any
-      // write, so closing the journal is all that's left.
-      this.repo.transaction(() => {
-        this.repo.closeJournal(j.id, 'rolled_back', result.warnings);
-        this.stopFollowing();
+      await this.repo.transaction(async () => {
+        await this.repo.closeJournal(j.id, 'rolled_back', result.warnings);
+        await this.stopFollowing();
       });
-      this.repo.logActivity('recovery', 'Went back to before an interrupted switch');
+      await this.repo.logActivity('recovery', 'Went back to before an interrupted switch');
       this.log.info('Interrupted operation rolled back', { journalId: j.id });
       return result;
     });
@@ -1450,16 +1419,16 @@ export class ProfilesService {
 
   createBackup(label) {
     return this.lock.run(async () => {
-      const account = this.requireAccount();
-      this.assertNoOpenJournal();
+      const account = await this.requireAccount();
+      await this.assertNoOpenJournal();
       const clean = String(label || '').trim().slice(0, 80) || 'Manual backup';
       const { authKey } = await this.session();
       const live = await this.readLive(authKey);
       this.checkLiveSize(live);
-      const id = this.repo.insertBackup({ kind: 'manual', label: clean, stremioUserId: account.stremio_user_id, snapshot: this.capture(live) });
-      this.repo.pruneBackups();
-      this.repo.logActivity('backup', `Backed up: "${clean}"`);
-      return this.repo.getBackup(id);
+      const id = await this.repo.insertBackup({ kind: 'manual', label: clean, stremioUserId: account.stremio_user_id, snapshot: this.capture(live) });
+      await this.repo.pruneBackups();
+      await this.repo.logActivity('backup', `Backed up: "${clean}"`);
+      return await this.repo.getBackup(id);
     });
   }
 
@@ -1470,8 +1439,8 @@ export class ProfilesService {
    */
   autoBackup() {
     return this.lock.run(async () => {
-      const account = this.requireAccount();
-      if (this.repo.getOpenJournal()) return { done: false, reason: 'unfinished switch' };
+      const account = await this.requireAccount();
+      if (await this.repo.getOpenJournal()) return { done: false, reason: 'unfinished switch' };
       let authKey;
       try {
         ({ authKey } = await this.session({ spend: false }));
@@ -1482,10 +1451,10 @@ export class ProfilesService {
       const live = await this.readLive(authKey);
       this.checkLiveSize(live);
       const snapshot = this.capture(live);
-      const last = this.repo.latestBackup('auto');
+      const last = await this.repo.latestBackup('auto');
       if (last && last.content_hash === snapshotHash(snapshot)) return { done: false, reason: 'unchanged' };
-      const id = this.repo.insertBackup({ kind: 'auto', label: 'Daily backup', stremioUserId: account.stremio_user_id, snapshot });
-      this.repo.pruneBackups();
+      const id = await this.repo.insertBackup({ kind: 'auto', label: 'Daily backup', stremioUserId: account.stremio_user_id, snapshot });
+      await this.repo.pruneBackups();
       return { done: true, backupId: id };
     });
   }
@@ -1495,13 +1464,13 @@ export class ProfilesService {
    * (add-ons, Cinemeta, imports). Restoring that backup is the edit's undo.
    * Call inside the operation's lock.
    */
-  backupProfileBeforeChange(profileId, label, editKind = null) {
-    const account = this.requireAccount();
-    const row = this.repo.getProfileRow(profileId);
+  async backupProfileBeforeChange(profileId, label, editKind = null) {
+    const account = await this.requireAccount();
+    const row = await this.repo.getProfileRow(profileId);
     if (!row) throw new UserError('NOT_FOUND', 'That profile no longer exists.');
     const snapshot = decodeSnapshot(this.repo.cipher, row, row.name);
-    const id = this.repo.insertBackup({ kind: 'pre_change', label, stremioUserId: account.stremio_user_id, snapshot, profileId, editKind });
-    this.repo.pruneBackups();
+    const id = await this.repo.insertBackup({ kind: 'pre_change', label, stremioUserId: account.stremio_user_id, snapshot, profileId, editKind });
+    await this.repo.pruneBackups();
     return id;
   }
 
@@ -1510,17 +1479,17 @@ export class ProfilesService {
    * in use: restoring or downloading that backup asks for its code, as
    * switching to it would. Null when it asks for nothing.
    */
-  lockedHolder(backup) {
+  async lockedHolder(backup) {
     const id = backup?.held_profile_id;
-    if (id == null || id === this.repo.getState()?.active_profile_id) return null;
-    const p = this.repo.getProfile(id);
+    if (id == null || id === (await this.repo.getState())?.active_profile_id) return null;
+    const p = await this.repo.getProfile(id);
     return p?.has_passcode ? p : null;
   }
 
   /** For a download: the code of the locked profile the backup holds, if any (counts like any try). */
   checkBackupPasscode(backupId, passcode = null) {
     return this.lock.run(async () => {
-      const holder = this.lockedHolder(this.repo.getBackup(backupId));
+      const holder = await this.lockedHolder(await this.repo.getBackup(backupId));
       if (holder) await this.verifyPasscode(holder, passcode);
     });
   }
@@ -1528,28 +1497,26 @@ export class ProfilesService {
   /** Write a backup to the account and make it the active profile's saved state. */
   restoreBackup(backupId, { passcode = null } = {}) {
     return this.lock.run(async () => {
-      const account = this.requireAccount();
-      this.assertNoOpenJournal();
-      const row = this.repo.getBackupRow(backupId);
+      const account = await this.requireAccount();
+      await this.assertNoOpenJournal();
+      const row = await this.repo.getBackupRow(backupId);
       if (!row) throw new UserError('NOT_FOUND', 'That backup no longer exists.');
-      const holder = this.lockedHolder(row);
+      const holder = await this.lockedHolder(row);
       if (holder) await this.verifyPasscode(holder, passcode);
-      const activeId = this.repo.getState()?.active_profile_id;
-      const active = activeId != null ? this.repo.getProfile(activeId) : null;
+      const activeId = (await this.repo.getState())?.active_profile_id;
+      const active = activeId != null ? await this.repo.getProfile(activeId) : null;
       if (!active) throw new UserError('NO_ACTIVE', 'No profile is active.');
       this.assertAnchor(row, account, 'This backup');
       const target = decodeSnapshot(this.repo.cipher, row, 'This backup');
 
-      // An edit's backup of a profile that isn't in use: undo only puts the
-      // profile's saved copy back. Nothing in Stremio changes.
-      const backupOf = row.profile_id != null && row.profile_id !== activeId ? this.repo.getProfile(row.profile_id) : null;
+      const backupOf = row.profile_id != null && row.profile_id !== activeId ? await this.repo.getProfile(row.profile_id) : null;
       if (backupOf) {
         const profile = backupOf;
-        this.repo.transaction(() => {
-          this.backupProfileBeforeChange(profile.id, `Before undoing an edit of "${profile.name}"`);
-          this.repo.saveProfileSnapshot(profile.id, target);
+        await this.repo.transaction(async () => {
+          await this.backupProfileBeforeChange(profile.id, `Before undoing an edit of "${profile.name}"`);
+          await this.repo.saveProfileSnapshot(profile.id, target);
         });
-        this.repo.logActivity('restore', `Put "${profile.name}" back to "${row.label}"`);
+        await this.repo.logActivity('restore', `Put "${profile.name}" back to "${row.label}"`);
         return { warnings: [], profileOnly: true };
       }
 
@@ -1557,23 +1524,23 @@ export class ProfilesService {
       const live = await this.readLive(authKey);
       this.checkLiveSize(live);
 
-      const journalId = this.repo.transaction(() => {
-        const preId = this.repo.insertBackup({
+      const journalId = await this.repo.transaction(async () => {
+        const preId = await this.repo.insertBackup({
           kind: 'pre_restore',
           label: `Before restoring "${row.label}"`,
           stremioUserId: account.stremio_user_id,
           snapshot: this.capture(live),
         });
-        return this.repo.startJournal({ kind: 'restore', fromProfileId: active.id, toProfileId: active.id, targetBackupId: backupId, rollbackBackupId: preId });
+        return await this.repo.startJournal({ kind: 'restore', fromProfileId: active.id, toProfileId: active.id, targetBackupId: backupId, rollbackBackupId: preId });
       });
       const result = await this.applyOrFail('restore', journalId, authKey, live, target, active.id);
-      this.repo.transaction(() => {
-        this.repo.saveProfileSnapshot(active.id, target);
-        this.repo.closeJournal(journalId, 'finished', result.warnings);
-        this.stopFollowing();
+      await this.repo.transaction(async () => {
+        await this.repo.saveProfileSnapshot(active.id, target);
+        await this.repo.closeJournal(journalId, 'finished', result.warnings);
+        await this.stopFollowing();
       });
-      this.repo.pruneBackups();
-      this.repo.logActivity('restore', `Restored "${row.label}"`);
+      await this.repo.pruneBackups();
+      await this.repo.logActivity('restore', `Restored "${row.label}"`);
       this.log.info('Backup restored', { backupId, journalId });
       return result;
     });
@@ -1581,11 +1548,12 @@ export class ProfilesService {
 
   deleteBackup(id) {
     return this.lock.run(async () => {
-      const backup = this.repo.getBackup(id);
+      const backup = await this.repo.getBackup(id);
       if (!backup) throw new UserError('NOT_FOUND', 'That backup no longer exists.');
       if (backup.kind === 'original') throw new UserError('PROTECTED', 'The setup backup is kept permanently.');
-      if (this.repo.pinnedBackupIds().has(id)) throw new UserError('RECOVERY_NEEDED', 'An unfinished switch needs this backup. Resolve it first.');
-      this.repo.deleteBackup(id);
+      const pinned = await this.repo.pinnedBackupIds();
+      if (pinned.has(id)) throw new UserError('RECOVERY_NEEDED', 'An unfinished switch needs this backup. Resolve it first.');
+      await this.repo.deleteBackup(id);
     });
   }
 
@@ -1594,11 +1562,9 @@ export class ProfilesService {
    * `passphrase` when given. Something that can't be decrypted is listed as
    * unreadable instead of failing the whole download.
    */
-  exportEverything(passphrase) {
-    const account = this.requireAccount();
-    const activeId = this.repo.getState()?.active_profile_id;
-    // Everything that decrypts goes in as it is, even if it wouldn't pass the checks a
-    // switch makes: the file is for keeping. Only a real decrypt failure is "unreadable".
+  async exportEverything(passphrase) {
+    const account = await this.requireAccount();
+    const activeId = (await this.repo.getState())?.active_profile_id;
     const decode = (row) => {
       try {
         return {
@@ -1611,44 +1577,51 @@ export class ProfilesService {
         throw err;
       }
     };
-    const exportPhoto = (profileId) => {
+    const exportPhoto = async (profileId) => {
       try {
-        const photo = this.repo.getProfilePhoto(profileId);
+        const photo = await this.repo.getProfilePhoto(profileId);
         return photo ? { photo: photo.toString('base64') } : {};
       } catch (err) {
         if (err instanceof DecryptError) return {};
         throw err;
       }
     };
-    // A passcode goes in as its salted hash (never the code), so a profile comes back locked.
-    const exportPasscode = (profileId) => {
-      const hash = this.repo.getPasscodeHash(profileId);
+    const exportPasscode = async (profileId) => {
+      const hash = await this.repo.getPasscodeHash(profileId);
       return hash ? { passcode_hash: hash } : {};
     };
-    const profiles = this.repo.listProfiles().map((p) => {
-      const snap = decode(this.repo.getProfileRow(p.id));
-      return {
+    const profileList = await this.repo.listProfiles();
+    const profiles = [];
+    for (const p of profileList) {
+      const snap = decode(await this.repo.getProfileRow(p.id));
+      const photoObj = await exportPhoto(p.id);
+      const passcodeObj = await exportPasscode(p.id);
+      profiles.push({
         name: p.name, avatar_preset: p.avatar_preset, avatar_colour: p.avatar_colour, active: p.id === activeId,
-        created_at: p.created_at, snapshot_taken_at: p.snapshot_taken_at, ...exportPhoto(p.id), ...exportPasscode(p.id),
+        created_at: p.created_at, snapshot_taken_at: p.snapshot_taken_at, ...photoObj, ...passcodeObj,
         ...(snap ? { library: snap.library, addons: snap.addons, notifs: snap.notifs } : { unreadable: true }),
-      };
-    });
-    // Deleted profiles still in the bin, kept in the file (bringing back a file doesn't re-add them).
-    const bin = this.repo.listBin().map((p) => {
-      const snap = decode(this.repo.getBinProfileRow(p.id));
-      return {
-        name: p.name, avatar_preset: p.avatar_preset, avatar_colour: p.avatar_colour, deleted_at: p.deleted_at, ...exportPhoto(p.id),
+      });
+    }
+    const binList = await this.repo.listBin();
+    const bin = [];
+    for (const p of binList) {
+      const snap = decode(await this.repo.getBinProfileRow(p.id));
+      const photoObj = await exportPhoto(p.id);
+      bin.push({
+        name: p.name, avatar_preset: p.avatar_preset, avatar_colour: p.avatar_colour, deleted_at: p.deleted_at, ...photoObj,
         ...(snap ? { library: snap.library, addons: snap.addons, notifs: snap.notifs } : { unreadable: true }),
-      };
-    });
-    const backups = this.repo.listBackups().map((b) => {
-      const snap = decode(this.repo.getBackupRow(b.id));
-      return {
+      });
+    }
+    const backupList = await this.repo.listBackups();
+    const backups = [];
+    for (const b of backupList) {
+      const snap = decode(await this.repo.getBackupRow(b.id));
+      backups.push({
         kind: b.kind, label: b.label, created_at: b.created_at,
         ...(snap ? { library: snap.library, addons: snap.addons, notifs: snap.notifs } : { unreadable: true }),
-      };
-    });
-    this.repo.logActivity('export', `Downloaded everything${passphrase ? ' (passphrase-protected)' : ''}`);
+      });
+    }
+    await this.repo.logActivity('export', `Downloaded everything${passphrase ? ' (passphrase-protected)' : ''}`);
     return sealExport({
       exported_at: new Date(this.now()).toISOString(),
       stremio_user_id: account.stremio_user_id,
@@ -1666,7 +1639,7 @@ export class ProfilesService {
    */
   importEverything(raw, { passphrase, acceptOtherAccount = false } = {}) {
     return this.lock.run(async () => {
-      const account = this.requireAccount();
+      const account = await this.requireAccount();
       const file = await openExport(raw, passphrase);
       if (file.stremio_user_id !== account.stremio_user_id && !acceptOtherAccount) {
         throw new UserError('OTHER_ACCOUNT', `This export is from ${file.stremio_email || 'another Stremio account'}. Tick the box to confirm you want it on this account anyway.`);
@@ -1680,12 +1653,11 @@ export class ProfilesService {
       };
       const profiles = (Array.isArray(file.profiles) ? file.profiles : []).filter(readable);
       const backups = (Array.isArray(file.backups) ? file.backups : []).filter(readable);
-      const room = MAX_PROFILES - this.repo.countProfiles();
+      const room = MAX_PROFILES - (await this.repo.countProfiles());
       if (profiles.length > room) {
         throw new UserError('TOO_MANY', `This export has ${profiles.length} profiles, and there's room for ${room} more. Delete some first.`);
       }
       const prepared = profiles.map((p, i) => ({ p, snap: check(p, `Profile ${i + 1} in the file`) }));
-      // Photos are drawn again like an upload; one that can't be read is left out.
       for (const x of prepared) {
         x.photo = typeof x.p.photo === 'string' ? await normalisePhoto(Buffer.from(x.p.photo, 'base64')) : null;
       }
@@ -1696,29 +1668,28 @@ export class ProfilesService {
         .sort((a, b) => b.at - a.at)
         .slice(0, IMPORT_MAX_BACKUPS);
       let addedProfiles = 0;
-      this.repo.transaction(() => {
+      await this.repo.transaction(async () => {
         for (const { p, snap, photo } of prepared) {
           const base = this.validateName(p.name);
           let name = base;
-          if (this.nameTaken(name)) name = `${base.slice(0, MAX_NAME_LENGTH - 11)} (imported)`;
-          for (let n = 2; this.nameTaken(name); n++) name = `${base.slice(0, MAX_NAME_LENGTH - 14)} (imported ${n})`;
+          if (await this.nameTaken(name)) name = `${base.slice(0, MAX_NAME_LENGTH - 11)} (imported)`;
+          for (let n = 2; await this.nameTaken(name); n++) name = `${base.slice(0, MAX_NAME_LENGTH - 14)} (imported ${n})`;
           let preset = isValidAvatar(p.avatar_preset) ? p.avatar_preset : 'initial';
           const colour = AVATAR_COLOURS.includes(p.avatar_colour) ? p.avatar_colour : DEFAULT_COLOUR;
           if (isPhoto(preset) && !photo) preset = 'initial';
           if (photo && isPhoto(preset)) preset = photoPreset(photoHash(photo));
-          const pid = this.repo.insertProfile({ name, avatarPreset: preset, avatarColour: colour, stremioUserId: account.stremio_user_id, snapshot: snap });
-          if (photo) this.repo.setProfilePhoto(pid, photo, photoHash(photo));
-          // Only a hash this build can check; with anything else the profile comes back unlocked.
-          if (isPasscodeHash(p.passcode_hash)) this.repo.setPasscodeHash(pid, p.passcode_hash);
+          const pid = await this.repo.insertProfile({ name, avatarPreset: preset, avatarColour: colour, stremioUserId: account.stremio_user_id, snapshot: snap });
+          if (photo) await this.repo.setProfilePhoto(pid, photo, photoHash(photo));
+          if (isPasscodeHash(p.passcode_hash)) await this.repo.setPasscodeHash(pid, p.passcode_hash);
           addedProfiles++;
         }
         for (const { b, snap, at } of newest) {
           const label = `${kindNames[b.kind] ?? 'Backup'}: ${String(b.label || 'Backup').slice(0, 60)} (from export)`;
-          this.repo.insertBackup({ kind: 'imported', label, stremioUserId: account.stremio_user_id, snapshot: snap, createdAt: at });
+          await this.repo.insertBackup({ kind: 'imported', label, stremioUserId: account.stremio_user_id, snapshot: snap, createdAt: at });
         }
       });
-      this.repo.pruneBackups();
-      this.repo.logActivity('import', `Brought back ${addedProfiles} profiles and ${newest.length} backups from an export`);
+      await this.repo.pruneBackups();
+      await this.repo.logActivity('import', `Brought back ${addedProfiles} profiles and ${newest.length} backups from an export`);
       return {
         profiles: addedProfiles,
         backups: newest.length,
@@ -1729,8 +1700,8 @@ export class ProfilesService {
   }
 
   /** Decrypted contents for download. Contains add-on URLs, which can include debrid keys. */
-  exportBackup(id) {
-    const row = this.repo.getBackupRow(id);
+  async exportBackup(id) {
+    const row = await this.repo.getBackupRow(id);
     if (!row) throw new UserError('NOT_FOUND', 'That backup no longer exists.');
     const { library, addons, notifs } = decodeSnapshot(this.repo.cipher, row, 'This backup');
     return {
@@ -1753,8 +1724,8 @@ export class ProfilesService {
    * Validate an uploaded StremShare backup and hold it briefly for the
    * confirm step, so the (possibly large) file is only sent once.
    */
-  previewImport(raw) {
-    const account = this.requireAccount();
+  async previewImport(raw) {
+    const account = await this.requireAccount();
     const parsed = parseStremShareBackup(raw);
     const id = randomToken(12);
     const now = this.now();
@@ -1781,7 +1752,7 @@ export class ProfilesService {
    */
   confirmImport(id, { asProfile = true, name, colour = DEFAULT_COLOUR, acceptOtherAccount = false } = {}) {
     return this.lock.run(async () => {
-      const account = this.requireAccount();
+      const account = await this.requireAccount();
       const entry = this.importStash.get(id);
       if (!entry || entry.expiresAt <= this.now()) {
         throw new UserError('IMPORT_EXPIRED', 'That upload has expired. Choose the file again.');
@@ -1794,48 +1765,48 @@ export class ProfilesService {
       let profile = null;
       let clean = null;
       if (asProfile) {
-        this.assertRoomForProfile();
+        await this.assertRoomForProfile();
         clean = this.validateName(name ?? suggestedProfileName(parsed.label));
-        this.assertNameFree(clean);
+        await this.assertNameFree(clean);
         this.validateColour(colour);
       }
-      const backupId = this.repo.transaction(() => {
-        const bid = this.repo.insertBackup({
+      const backupId = await this.repo.transaction(async () => {
+        const bid = await this.repo.insertBackup({
           kind: 'imported',
           label: `From StremShare: ${parsed.label ?? 'backup'}`,
           stremioUserId: account.stremio_user_id,
           snapshot,
         });
         if (asProfile) {
-          const pid = this.repo.insertProfile({ name: clean, avatarPreset: 'initial', avatarColour: colour, stremioUserId: account.stremio_user_id, snapshot });
-          profile = this.repo.getProfile(pid);
+          const pid = await this.repo.insertProfile({ name: clean, avatarPreset: 'initial', avatarColour: colour, stremioUserId: account.stremio_user_id, snapshot });
+          profile = await this.repo.getProfile(pid);
         }
         return bid;
       });
       this.importStash.delete(id);
-      this.repo.pruneBackups();
-      this.repo.logActivity('import', profile ? `Imported "${profile.name}" from StremShare` : 'Imported a StremShare backup');
+      await this.repo.pruneBackups();
+      await this.repo.logActivity('import', profile ? `Imported "${profile.name}" from StremShare` : 'Imported a StremShare backup');
       this.log.info('StremShare backup imported', { backupId, profileId: profile?.id ?? null });
-      return { profile, backup: this.repo.getBackup(backupId) };
+      return { profile, backup: await this.repo.getBackup(backupId) };
     });
   }
 
   // ── helpers ──────────────────────────────────────────────────────────────
 
-  requireAccount() {
-    const account = this.repo.getAccount();
+  async requireAccount() {
+    const account = await this.repo.getAccount();
     if (!account) throw new UserError('NOT_LINKED', 'Sign in with Stremio first.');
     return account;
   }
 
-  requireProfile(id) {
-    const profile = this.repo.getProfile(id);
+  async requireProfile(id) {
+    const profile = await this.repo.getProfile(id);
     if (!profile) throw new UserError('NOT_FOUND', 'That profile no longer exists.');
     return profile;
   }
 
-  assertNoOpenJournal() {
-    if (this.repo.getOpenJournal()) {
+  async assertNoOpenJournal() {
+    if (await this.repo.getOpenJournal()) {
       throw new UserError('RECOVERY_NEEDED', "A previous switch didn't finish. Open the OpenProfiles page to finish it or go back first.");
     }
   }
@@ -1852,9 +1823,9 @@ export class ProfilesService {
    * account. Counts against the account's Stremio budget unless `spend` is false.
    */
   async session({ spend = true } = {}) {
-    const account = this.requireAccount();
+    const account = await this.requireAccount();
     if (spend) this.spendStremio();
-    const authKey = this.repo.getAuthKey();
+    const authKey = await this.repo.getAuthKey();
     const user = await this.stremio.getUser(authKey);
     if (user.id !== account.stremio_user_id) {
       throw new UserError('ACCOUNT_CHANGED', 'The stored Stremio sign-in now points at a different account. Sign in again.');
@@ -1886,8 +1857,8 @@ export class ProfilesService {
   }
 
   /** What to save into a profile: notifications that belong to another profile aren't. */
-  profileCopy(captured) {
-    return this.repo.getState()?.notifs_foreign ? { ...captured, notifs: null } : captured;
+  async profileCopy(captured) {
+    return (await this.repo.getState())?.notifs_foreign ? { ...captured, notifs: null } : captured;
   }
 
   /** Snapshots are stored exactly as Stremio returned them. Never clean them up: see isCleanTombstone. */
@@ -1904,16 +1875,16 @@ export class ProfilesService {
     return clean;
   }
 
-  nameTaken(name) {
-    return this.repo.listProfiles().some((p) => p.name.toLowerCase() === name.toLowerCase());
+  async nameTaken(name) {
+    return (await this.repo.listProfiles()).some((p) => p.name.toLowerCase() === name.toLowerCase());
   }
 
-  assertNameFree(name) {
-    if (this.nameTaken(name)) throw new UserError('NAME_TAKEN', `There's already a profile called "${name}".`);
+  async assertNameFree(name) {
+    if (await this.nameTaken(name)) throw new UserError('NAME_TAKEN', `There's already a profile called "${name}".`);
   }
 
-  assertRoomForProfile() {
-    if (this.repo.countProfiles() >= MAX_PROFILES) {
+  async assertRoomForProfile() {
+    if ((await this.repo.countProfiles()) >= MAX_PROFILES) {
       throw new UserError('TOO_MANY', `An account can have up to ${MAX_PROFILES} profiles. Delete one first.`);
     }
   }

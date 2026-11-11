@@ -55,10 +55,20 @@ export function loadConfig(env = process.env) {
   const logLevel = (env.LOG_LEVEL || 'info').toLowerCase();
   if (!LOG_LEVELS.has(logLevel)) problems.push(`LOG_LEVEL must be one of: ${[...LOG_LEVELS].join(', ')}`);
 
+  // DATABASE_URL is required for Supabase PostgreSQL (accepts SUPABASE_DATABASE_URL as alias).
+  const databaseUrl = (env.DATABASE_URL || env.SUPABASE_DATABASE_URL || '').trim();
+  if (!databaseUrl) {
+    problems.push('DATABASE_URL (or SUPABASE_DATABASE_URL) is required (the PostgreSQL connection string from Supabase)');
+  }
+
+  // SECRET_KEY is required when there's no local filesystem for secret.key (accepts ENCRYPTION_KEY as alias).
+  const secretKey = (env.SECRET_KEY || env.ENCRYPTION_KEY || '').trim() || null;
+
   if (problems.length) throw new ConfigError(problems);
 
   return {
     publicUrl,
+    databaseUrl,
     // ACCESS, ALLOWED_ACCOUNTS, MAX_ACCOUNTS, REMOVE_UNUSED_DAYS, LOG_LEVEL, OPERATOR and PRIVACY_NOTE are
     // checked here so a typo stops the first boot, but the running server reads them
     // through core/settings.js: the Server tab can override each one.
@@ -70,7 +80,7 @@ export function loadConfig(env = process.env) {
     port,
     logLevel,
     dataDir: path.resolve(env.DATA_DIR || './data'),
-    secretKey: env.SECRET_KEY || null,
+    secretKey,
     stremioApiUrl: (env.STREMIO_API_URL || 'https://api.strem.io').replace(/\/+$/, ''),
     // Express "trust proxy": the default covers a reverse proxy on the same
     // host or Docker network (Caddy, Traefik, nginx).

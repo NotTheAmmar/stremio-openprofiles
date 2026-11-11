@@ -10,6 +10,12 @@ affiliated with Stremio. To try it first, there's a free shared server at
 [privacy page](https://openprofiles.kgenovz.com/privacy) says what it keeps. Running your own is
 recommended: it's light, and then your add-on links never leave your hands.
 
+> [!TIP]
+> **🚀 Free Cloud Deployment (Supabase + Render)**  
+> You can host OpenProfiles permanently for free on **Render (Free Web Service)** and **Supabase (Free PostgreSQL)** with **UptimeRobot** monitoring. No local servers, home hardware, or paid VPS required!  
+>  
+> 📖 Follow the complete, beginner-friendly [**Deployment Guide (DEPLOYMENT.md)**](DEPLOYMENT.md).
+
 <p align="center">
   <img src="docs/screenshots/demo.gif" width="300" alt="On an Android phone: opening Kids in the Switch profile row switches the account, a tap refreshes Stremio, and Kids' library and Home appear; switching back to Kyle works the same way">
 </p>
@@ -177,6 +183,15 @@ docker compose pull && docker compose up -d
 The example compose file follows `1`, so this brings every 1.x release (new features and
 fixes). A 2.0 would need changes by hand, and would only come with a new tag. Database changes are applied on start, and each release says in
 [CHANGELOG.md](CHANGELOG.md) if anything needs doing by hand.
+
+## Cloud Deployment (Render + Supabase)
+
+If you prefer not to manage a home server, VPS, or Docker container, OpenProfiles can be deployed permanently for free to **Render Web Services** backed by **Supabase PostgreSQL**.
+
+- **Ephemeral filesystem safe**: Uses remote Supabase PostgreSQL instead of local SQLite.
+- **Persistent encryption**: Uses a persistent Render environment variable (`SECRET_KEY`).
+- **Health monitoring**: Integrated `/health` endpoint for UptimeRobot monitoring.
+- **Full Guide**: See [**DEPLOYMENT.md**](DEPLOYMENT.md) for step-by-step setup instructions.
 
 ## Running the server
 

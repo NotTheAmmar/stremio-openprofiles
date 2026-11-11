@@ -41,10 +41,10 @@ function handoffPage(target, colour = BRAND_COLOUR) {
 export const REDIRECT_TARGETS = { home: 'stremio:///', library: 'stremio:///library' };
 
 /** The profile's uploaded photo when its picture is the photo, else null. */
-function photoOf(service, p) {
+async function photoOf(service, p) {
   if (!isPhoto(p.avatar_preset)) return null;
   try {
-    return service.repo.getProfilePhoto(p.id);
+    return await service.repo.getProfilePhoto(p.id);
   } catch {
     return null; // unreadable: the letter is drawn instead
   }
@@ -72,10 +72,11 @@ export function createAddonRouter({ config, accounts, log, settings, waitMs = SW
 
   /** Resolves the token to its account, or answers 404 (same as an unknown path, so tokens can't be probed). */
   const withToken = (handler) => async (req, res) => {
-    const hit = accounts.byAddonToken(req.params.token);
+    const hit = await accounts.byAddonToken(req.params.token);
     if (!hit) return res.status(404).json({ err: 'Not found' });
     accounts.noteAddonUse(hit.account.id);
-    return handler(req, res, hit.service.repo.getState(), hit.service);
+    const state = await hit.service.repo.getState();
+    return handler(req, res, state, hit.service);
   };
 
   const base = (token) => `${publicUrl}/${token}`;
@@ -176,20 +177,20 @@ export function createAddonRouter({ config, accounts, log, settings, waitMs = SW
   // Stremio's "Configure" button opens <transport base>/configure.
   router.get('/:token/configure', withToken((req, res) => res.redirect(303, '/configure')));
 
-  const catalog = withToken((req, res, state, service) => {
+  const catalog = withToken(async (req, res, state, service) => {
     noStore(res);
     // Any of the row's ids gets the current list: a copy saved under another profile's id is fine too.
     if (req.params.type !== CATALOG_TYPE || !isCatalogId(req.params.id)) return res.json({ metas: [] });
-    const metas = service.repo.listProfiles().map((p) => preview(state.addon_token, p, p.id === state.active_profile_id));
+    const metas = (await service.repo.listProfiles()).map((p) => preview(state.addon_token, p, p.id === state.active_profile_id));
     return res.json({ metas });
   });
   router.get('/:token/catalog/:type/:id.json', cors, catalog);
   router.get('/:token/catalog/:type/:id/:extra.json', cors, catalog);
 
-  router.get('/:token/meta/:type/:id.json', cors, withToken((req, res, state, service) => {
+  router.get('/:token/meta/:type/:id.json', cors, withToken(async (req, res, state, service) => {
     noStore(res);
     const id = parseProfileMetaId(req.params.id);
-    const p = id && service.repo.getProfile(id);
+    const p = id && (await service.repo.getProfile(id));
     if (!p) return res.status(404).json({ meta: null });
     const active = p.id === state.active_profile_id;
     return res.json({
@@ -208,7 +209,7 @@ export function createAddonRouter({ config, accounts, log, settings, waitMs = SW
   router.get('/:token/stream/:type/:id.json', cors, withToken(async (req, res, state, service) => {
     noStore(res);
     const id = parseProfileMetaId(req.params.id);
-    const p = id && service.repo.getProfile(id);
+    const p = id && (await service.repo.getProfile(id));
     if (!p) return res.json({ streams: [pageStream("Couldn't switch: that profile no longer exists.\nTap to open OpenProfiles.")] });
 
     // A locked profile doesn't switch from here. Unlocking switches, so refreshing afterwards
@@ -246,22 +247,24 @@ export function createAddonRouter({ config, accounts, log, settings, waitMs = SW
     });
   }));
 
-  router.get('/:token/poster/:id.png', withToken(async (req, res, state, service) => {
-    const p = service.repo.getProfile(Number(req.params.id));
+  router.get('/:token/poster/:id.png', cors, withToken(async (req, res, state, service) => {
+    const p = await service.repo.getProfile(Number(req.params.id));
     if (!p) return res.status(404).end();
     const active = p.id === state.active_profile_id;
     const locked = Boolean(p.has_passcode);
+    const photo = await photoOf(service, p);
     // A photo preset names its photo's hash, so the cache key changes with the photo.
     const png = await art.get(`poster|${p.name}|${p.avatar_colour}|${p.avatar_preset}|${active}|${locked}`,
-      () => renderPoster({ name: p.name, colour: p.avatar_colour, avatar: p.avatar_preset, active, locked, photo: photoOf(service, p) }));
+      () => renderPoster({ name: p.name, colour: p.avatar_colour, avatar: p.avatar_preset, active, locked, photo }));
     res.set('Cache-Control', 'private, max-age=86400').type('png').send(png);
   }));
 
-  router.get('/:token/background/:id.png', withToken(async (req, res, state, service) => {
-    const p = service.repo.getProfile(Number(req.params.id));
+  router.get('/:token/background/:id.png', cors, withToken(async (req, res, state, service) => {
+    const p = await service.repo.getProfile(Number(req.params.id));
     if (!p) return res.status(404).end();
+    const photo = await photoOf(service, p);
     const png = await art.get(`bg|${p.name}|${p.avatar_colour}|${p.avatar_preset}`,
-      () => renderBackground({ name: p.name, colour: p.avatar_colour, avatar: p.avatar_preset, photo: photoOf(service, p) }));
+      () => renderBackground({ name: p.name, colour: p.avatar_colour, avatar: p.avatar_preset, photo }));
     res.set('Cache-Control', 'private, max-age=86400').type('png').send(png);
   }));
 

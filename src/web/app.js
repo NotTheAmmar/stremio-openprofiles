@@ -114,7 +114,7 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
     themeVersion: themeVersion(),
     shared: settings.get('access') !== 'owner',
     removeUnusedDays: settings.get('access') === 'open' ? settings.get('removeUnusedDays') : 0,
-    admin: Boolean(req?.session && accounts.isAdmin(req.session.accountId)),
+    admin: Boolean(req?.isAdmin),
   });
   app.set('trust proxy', config.trustProxy);
   app.disable('x-powered-by');
@@ -137,10 +137,10 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
     try {
       const result = await fn(req);
       if (result?.redirect) to = result.redirect;
-      if (result?.text) auth.setFlash(req, { type: 'ok', text: result.text, details: result.details });
+      if (result?.text) await auth.setFlash(req, { type: 'ok', text: result.text, details: result.details });
     } catch (err) {
       if (!err.userMessage) log.error('Unexpected error', { path: logPath(req.path), error: err.message, stack: err.stack });
-      auth.setFlash(req, { type: 'error', text: userMessageOf(err) });
+      await auth.setFlash(req, { type: 'error', text: userMessageOf(err) });
     }
     res.redirect(303, to);
   };
@@ -155,7 +155,17 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
     }
   };
 
-  app.get('/health', (req, res) => res.json({ ok: true }));
+  app.get('/health', async (req, res) => {
+    try {
+      const isHealthy = await db.healthy();
+      if (isHealthy) {
+        return res.status(200).json({ status: 'ok' });
+      }
+      return res.status(503).json({ status: 'unhealthy', error: 'Database unreachable' });
+    } catch {
+      return res.status(503).json({ status: 'unhealthy', error: 'Service unavailable' });
+    }
+  });
   app.get('/privacy', (req, res) => sendPage(res, privacyPage({ site: site() })));
   // The accent colour (the page's CSP allows no inline styles). Links carry ?v=, so it can cache.
   app.get('/theme.css', (req, res) => res.set('Cache-Control', 'public, max-age=3600').type('css').send(themeCss(settings.branding())));
@@ -203,7 +213,7 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
       const flash = created
         ? { type: 'ok', text: 'Welcome! Your account as it is now is saved as your "Original" profile, with a permanent backup.', details: warnings }
         : warnings.length ? { type: 'ok', text: 'Signed in.', details: warnings } : null;
-      auth.startSession(req, res, accountId, email, flash);
+      await auth.startSession(req, res, accountId, email, flash);
       // Signed in again to reset a forgotten passcode: straight back to it.
       const passcodeFor = profileIdOf(req.body?.passcodeFor);
       return res.redirect(303, passcodeFor ? `/profiles/${passcodeFor}#passcode` : '/configure');
@@ -218,13 +228,18 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
   app.use(createAddonRouter({ config, accounts, log, settings }));
 
   const r = express.Router();
-  r.use(auth.require, auth.csrf, (req, res, next) => {
-    req.service = accounts.forAccount(req.session.accountId);
-    next();
+  r.use(auth.require, auth.csrf, async (req, res, next) => {
+    try {
+      req.service = accounts.forAccount(req.session.accountId);
+      req.isAdmin = await accounts.isAdmin(req.session.accountId);
+      next();
+    } catch (err) {
+      next(err);
+    }
   });
 
-  r.post('/logout', (req, res) => {
-    auth.logout(req, res);
+  r.post('/logout', async (req, res) => {
+    await auth.logout(req, res);
     res.redirect(303, '/signin');
   });
 
@@ -244,19 +259,19 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
     return next();
   };
 
-  const page = (req, extra = {}) => ({ site: site(req), csrf: req.session.csrf, account: req.service.status().account, flash: auth.takeFlash(req), ...extra });
+  const page = async (req, extra = {}) => ({ site: site(req), csrf: req.session.csrf, account: (await req.service.status()).account, flash: await auth.takeFlash(req), ...extra });
   const notFound = (res, message, req = null) => sendPage(res, errorPage({ site: site(req), status: 404, message }), 404);
   /** The Undo bar's edit, unless this browser hid the bar for it. */
-  const undoFor = (req) => {
-    const undo = req.service.latestUndo();
+  const undoFor = async (req) => {
+    const undo = await req.service.latestUndo();
     return undo && undo.id !== auth.hiddenUndo(req) ? undo : null;
   };
 
   // ── Profiles tab ───────────────────────────────────────────────────────────
 
-  r.get('/configure', (req, res) => {
-    const status = req.service.status();
-    return sendPage(res, profilesPage({ ...page(req), status, addon: req.service.addonInfo(), undo: undoFor(req) }));
+  r.get('/configure', async (req, res) => {
+    const status = await req.service.status();
+    return sendPage(res, profilesPage({ ...(await page(req)), status, addon: await req.service.addonInfo(), undo: await undoFor(req) }));
   });
 
   r.get('/profiles/new', async (req, res) => {
@@ -265,14 +280,14 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
       options = await req.service.wizardOptions();
     } catch (err) {
       if (!err.userMessage) log.error('Wizard failed to load', { error: err.message });
-      auth.setFlash(req, { type: 'error', text: userMessageOf(err) });
+      await auth.setFlash(req, { type: 'error', text: userMessageOf(err) });
       return res.redirect(303, '/configure');
     }
     if (!options.room) {
-      auth.setFlash(req, { type: 'error', text: 'You have as many profiles as an account can have. Delete one first.' });
+      await auth.setFlash(req, { type: 'error', text: 'You have as many profiles as an account can have. Delete one first.' });
       return res.redirect(303, '/configure');
     }
-    return sendPage(res, wizardPage({ ...page(req), options }));
+    return sendPage(res, wizardPage({ ...(await page(req)), options }));
   });
 
   // The wizard posts here (and so can a plain form with just a name).
@@ -301,7 +316,7 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
         switchNow: values.switchNow,
       });
       const switched = p.switched && !p.switched.alreadyActive;
-      auth.setFlash(req, {
+      await auth.setFlash(req, {
         type: 'ok',
         text: switched
           ? `Created "${p.name}" and switched to it. Click back into Stremio and it refreshes (Stremio 5). Other apps: close and reopen them.`
@@ -312,39 +327,39 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
     } catch (err) {
       if (!err.userMessage) log.error('Profile creation failed', { error: err.message, stack: err.stack });
       if (b.wizard !== '1') {
-        auth.setFlash(req, { type: 'error', text: userMessageOf(err) });
+        await auth.setFlash(req, { type: 'error', text: userMessageOf(err) });
         return res.redirect(303, '/configure');
       }
       // Back to the wizard with what was picked, so nothing has to be done again.
       try {
         const options = await req.service.wizardOptions();
-        return sendPage(res, wizardPage({ ...page(req), options, error: userMessageOf(err), values }), 400);
+        return sendPage(res, wizardPage({ ...(await page(req)), options, error: userMessageOf(err), values }), 400);
       } catch {
-        auth.setFlash(req, { type: 'error', text: userMessageOf(err) });
+        await auth.setFlash(req, { type: 'error', text: userMessageOf(err) });
         return res.redirect(303, '/configure');
       }
     }
   });
 
-  r.get('/profiles/:id', (req, res) => {
+  r.get('/profiles/:id', async (req, res) => {
     const id = idParam(req);
-    if (!req.service.repo.getProfile(id)) return notFound(res, 'That profile no longer exists.', req);
-    const status = req.service.status();
+    if (!(await req.service.repo.getProfile(id))) return notFound(res, 'That profile no longer exists.', req);
+    const status = await req.service.status();
     return sendPage(res, profilesPage({
-      ...page(req), status, addon: req.service.addonInfo(), undo: undoFor(req), editing: req.service.profileDetails(id), fresh: auth.fresh(req),
+      ...(await page(req)), status, addon: await req.service.addonInfo(), undo: await undoFor(req), editing: await req.service.profileDetails(id), fresh: auth.fresh(req),
     }));
   });
 
   /** A locked profile's passcode page, signed in: it posts to the profile's Switch. */
-  const sendPasscodePage = (req, res, p, error = null, status = 200) => sendPage(res, passcodePage({
-    ...page(req), profile: p, picture: avatarUrl(p), action: `/profiles/${p.id}/switch`, error, cancel: '/configure',
+  const sendPasscodePage = async (req, res, p, error = null, status = 200) => sendPage(res, passcodePage({
+    ...(await page(req)), profile: p, picture: avatarUrl(p), action: `/profiles/${p.id}/switch`, error, cancel: '/configure',
   }), status);
 
-  r.get('/profiles/:id/unlock', (req, res) => {
-    const p = req.service.repo.getProfile(idParam(req));
+  r.get('/profiles/:id/unlock', async (req, res) => {
+    const p = await req.service.repo.getProfile(idParam(req));
     if (!p) return notFound(res, 'That profile no longer exists.', req);
-    if (!p.has_passcode || p.id === req.service.repo.getState()?.active_profile_id) return res.redirect(303, '/configure');
-    return sendPasscodePage(req, res, p);
+    if (!p.has_passcode || p.id === (await req.service.repo.getState())?.active_profile_id) return res.redirect(303, '/configure');
+    return await sendPasscodePage(req, res, p);
   });
 
   // A locked profile's Switch button posts without a code: that opens its passcode page first.
@@ -353,7 +368,7 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
     const passcode = typeof req.body.passcode === 'string' ? req.body.passcode : null;
     try {
       const result = await req.service.switchTo(id, { passcode, via: 'web' });
-      auth.setFlash(req, result.alreadyActive
+      await auth.setFlash(req, result.alreadyActive
         ? { type: 'ok', text: `"${result.profile.name}" is already in use.` }
         : {
           type: 'ok',
@@ -361,13 +376,13 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
           details: result.warnings,
         });
     } catch (err) {
-      const p = Object.hasOwn(PASSCODE_REFUSALS, err.code) ? req.service.repo.getProfile(id) : null;
+      const p = Object.hasOwn(PASSCODE_REFUSALS, err.code) ? await req.service.repo.getProfile(id) : null;
       if (p) {
         if (passcode === null && err.code === 'PASSCODE_NEEDED') return res.redirect(303, `/profiles/${id}/unlock`);
-        return sendPasscodePage(req, res, p, err.userMessage, PASSCODE_REFUSALS[err.code]);
+        return await sendPasscodePage(req, res, p, err.userMessage, PASSCODE_REFUSALS[err.code]);
       }
       if (!err.userMessage) log.error('Unexpected error', { path: logPath(req.path), error: err.message, stack: err.stack });
-      auth.setFlash(req, { type: 'error', text: userMessageOf(err) });
+      await auth.setFlash(req, { type: 'error', text: userMessageOf(err) });
     }
     return res.redirect(303, '/configure');
   });
@@ -397,12 +412,12 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
   }, (req) => (req.query.back === 'edit' ? `/profiles/${idParam(req)}#saved` : '/configure')));
 
   r.post('/profiles/:id/rename', action(async (req) => {
-    req.service.renameProfile(idParam(req), req.body.name);
+    await req.service.renameProfile(idParam(req), req.body.name);
     return { text: 'Renamed.' };
   }, (req) => `/profiles/${idParam(req)}#basics`));
 
   r.post('/profiles/:id/avatar', action(async (req) => {
-    req.service.setAvatar(idParam(req), req.body.colour, req.body.picture);
+    await req.service.setAvatar(idParam(req), req.body.colour, req.body.picture);
     return { text: 'Picture saved.' };
   }, (req) => `/profiles/${idParam(req)}#picture`));
 
@@ -410,16 +425,16 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
   // they're decoded and drawn again before anything is kept.
   r.post('/profiles/:id/photo', oneUpload, express.raw({ type: () => true, limit: PHOTO_UPLOAD_MAX }), json(async (req) => {
     const id = idParam(req);
-    req.service.requireProfile(id);
+    await req.service.requireProfile(id);
     const jpeg = await normalisePhoto(req.body);
     if (!jpeg) throw new UserError('PHOTO', "That picture couldn't be read. Use a PNG, JPG or WebP photo.");
-    const p = req.service.setPhoto(id, jpeg);
-    auth.setFlash(req, { type: 'ok', text: `New photo for ${p.name}. Stremio shows it from the next time it loads the row.` });
+    const p = await req.service.setPhoto(id, jpeg);
+    await auth.setFlash(req, { type: 'ok', text: `New photo for ${p.name}. Stremio shows it from the next time it loads the row.` });
     return { ok: true };
   }));
 
   r.post('/profiles/:id/photo/remove', action(async (req) => {
-    const p = req.service.removePhoto(idParam(req));
+    const p = await req.service.removePhoto(idParam(req));
     return { text: `Removed ${p.name}'s photo.` };
   }, (req) => `/profiles/${idParam(req)}#picture`));
 
@@ -432,13 +447,13 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
 
   r.get('/profiles/:id/addons', async (req, res) => {
     const id = idParam(req);
-    if (!req.service.repo.getProfile(id)) return notFound(res, 'That profile no longer exists.', req);
+    if (!(await req.service.repo.getProfile(id))) return notFound(res, 'That profile no longer exists.', req);
     try {
       const manager = await req.service.addonManager(id);
-      return sendPage(res, addonManagerPage({ ...page(req), manager, undo: undoFor(req) }));
+      return sendPage(res, addonManagerPage({ ...(await page(req)), manager, undo: await undoFor(req) }));
     } catch (err) {
       if (!err.userMessage) log.error('Add-on manager failed to load', { error: err.message });
-      auth.setFlash(req, { type: 'error', text: userMessageOf(err) });
+      await auth.setFlash(req, { type: 'error', text: userMessageOf(err) });
       return res.redirect(303, `/profiles/${id}#addons`);
     }
   });
@@ -512,11 +527,11 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
   });
 
   r.post('/edits/:id/undo', action(async (req) => {
-    const what = req.service.repo.getBackup(idParam(req))?.edit_kind === 'cinemeta' ? 'Cinemeta is' : 'add-ons are';
+    const what = (await req.service.repo.getBackup(idParam(req)))?.edit_kind === 'cinemeta' ? 'Cinemeta is' : 'add-ons are';
     const result = await req.service.undoEdit(idParam(req));
     return { text: `Undone: ${result.profile.name}'s ${what} back as before${result.active ? ', in Stremio too' : ''}.` };
-  }, (req) => {
-    const row = req.service.repo.getBackup(idParam(req));
+  }, async (req) => {
+    const row = await req.service.repo.getBackup(idParam(req));
     return row?.profile_id ? `/profiles/${row.profile_id}#addons` : '/configure';
   }));
 
@@ -534,8 +549,8 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
 
   // ── Backups tab ────────────────────────────────────────────────────────────
 
-  r.get('/backups', (req, res) => sendPage(res, backupsPage({
-    ...page(req), backups: req.service.listBackups(), bin: req.service.listBin(), undo: undoFor(req),
+  r.get('/backups', async (req, res) => sendPage(res, backupsPage({
+    ...(await page(req)), backups: await req.service.listBackups(), bin: await req.service.listBin(), undo: await undoFor(req),
   })));
 
   r.post('/backups', action(async (req) => {
@@ -544,7 +559,7 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
   }, '/backups'));
 
   // Step 1 of an import: the page's script uploads the file and gets a summary back.
-  r.post('/import/preview', oneUpload, express.text({ type: '*/*', limit: '64mb' }), (req, res) => {
+  r.post('/import/preview', oneUpload, express.text({ type: '*/*', limit: '64mb' }), async (req, res) => {
     res.set('Cache-Control', 'no-store');
     let raw;
     try {
@@ -553,7 +568,7 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
       return res.status(400).json({ error: "That file isn't valid JSON, so it can't be a StremShare backup." });
     }
     try {
-      return res.json(req.service.previewImport(raw));
+      return res.json(await req.service.previewImport(raw));
     } catch (err) {
       if (!err.userMessage) log.error('Import preview failed', { error: err.message });
       return res.status(400).json({ error: userMessageOf(err) });
@@ -573,37 +588,37 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
   }, '/backups'));
 
   /** A backup's restore preview; a backup of a locked profile asks for its passcode there. */
-  const sendRestorePreview = (req, res, backup, error = null, code = 200) => {
-    const status = req.service.status();
+  const sendRestorePreview = async (req, res, backup, error = null, code = 200) => {
+    const status = await req.service.status();
     const active = status.profiles.find((p) => p.id === status.activeProfileId) || null;
-    const backupOf = backup.profile_id != null && backup.profile_id !== status.activeProfileId ? req.service.repo.getProfile(backup.profile_id) : null;
-    const addonsOnly = backup.kind === 'pre_change' && backup.profile_id != null && Boolean(req.service.repo.getProfile(backup.profile_id));
+    const backupOf = backup.profile_id != null && backup.profile_id !== status.activeProfileId ? await req.service.repo.getProfile(backup.profile_id) : null;
+    const addonsOnly = backup.kind === 'pre_change' && backup.profile_id != null && Boolean(await req.service.repo.getProfile(backup.profile_id));
     return sendPage(res, restorePreviewPage({
       site: site(req),
       csrf: req.session.csrf, backup, active, locked: Boolean(status.openJournal), account: status.account, backupOf, addonsOnly,
-      codeFor: req.service.lockedHolder(backup), error,
+      codeFor: await req.service.lockedHolder(backup), error,
     }), code);
   };
 
-  r.get('/backups/:id/restore', (req, res) => {
-    const backup = req.service.getBackup(idParam(req));
+  r.get('/backups/:id/restore', async (req, res) => {
+    const backup = await req.service.getBackup(idParam(req));
     if (!backup) return notFound(res, 'That backup no longer exists.', req);
-    return sendRestorePreview(req, res, backup);
+    return await sendRestorePreview(req, res, backup);
   });
 
   r.post('/backups/:id/restore', async (req, res) => {
     const id = idParam(req);
     try {
       const result = await req.service.restoreBackup(id, { passcode: typeof req.body.passcode === 'string' ? req.body.passcode : null });
-      auth.setFlash(req, result.profileOnly
+      await auth.setFlash(req, result.profileOnly
         ? { type: 'ok', text: "Put back. Only that profile's saved copy changed; Stremio didn't." }
         : { type: 'ok', text: 'Backup restored. Click back into Stremio and it refreshes (Stremio 5). Other apps: close and reopen them.', details: result.warnings });
       return res.redirect(303, result.profileOnly ? '/backups' : '/configure');
     } catch (err) {
-      const backup = Object.hasOwn(PASSCODE_REFUSALS, err.code) ? req.service.getBackup(id) : null;
-      if (backup) return sendRestorePreview(req, res, backup, err.userMessage, PASSCODE_REFUSALS[err.code]);
+      const backup = Object.hasOwn(PASSCODE_REFUSALS, err.code) ? await req.service.getBackup(id) : null;
+      if (backup) return await sendRestorePreview(req, res, backup, err.userMessage, PASSCODE_REFUSALS[err.code]);
       if (!err.userMessage) log.error('Unexpected error', { path: logPath(req.path), error: err.message, stack: err.stack });
-      auth.setFlash(req, { type: 'error', text: userMessageOf(err) });
+      await auth.setFlash(req, { type: 'error', text: userMessageOf(err) });
       return res.redirect(303, '/configure');
     }
   });
@@ -620,13 +635,13 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
   }, '/backups#bin'));
 
   // Every profile and backup in one file; sealed with a passphrase if one is given.
-  r.post('/export', (req, res) => {
+  r.post('/export', async (req, res) => {
     const passphrase = String(req.body.passphrase || '');
     if (passphrase && passphrase.length < 8) {
-      auth.setFlash(req, { type: 'error', text: 'Use a passphrase of at least 8 characters, or leave it empty.' });
+      await auth.setFlash(req, { type: 'error', text: 'Use a passphrase of at least 8 characters, or leave it empty.' });
       return res.redirect(303, '/backups#everything');
     }
-    const data = req.service.exportEverything(passphrase || null);
+    const data = await req.service.exportEverything(passphrase || null);
     res.set('Cache-Control', 'no-store');
     res.attachment(`openprofiles-everything-${new Date().toISOString().slice(0, 10)}.json`);
     return res.json(data);
@@ -638,7 +653,7 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
     try {
       const { file, passphrase, acceptOtherAccount } = req.body || {};
       const result = await req.service.importEverything(file, { passphrase: passphrase || null, acceptOtherAccount: acceptOtherAccount === true });
-      auth.setFlash(req, {
+      await auth.setFlash(req, {
         type: 'ok',
         text: `Brought back ${result.profiles} profile${result.profiles === 1 ? '' : 's'} and ${result.backups} backup${result.backups === 1 ? '' : 's'}${result.olderLeftOut ? ` (the newest; ${result.olderLeftOut} older ones stay in the file)` : ''}. Nothing in Stremio changed.`,
         details: result.skipped ? [`${result.skipped} item${result.skipped === 1 ? " couldn't" : "s couldn't"} be read and ${result.skipped === 1 ? 'was' : 'were'} skipped.`] : [],
@@ -655,10 +670,10 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
     return { text: 'Backup deleted.' };
   }, '/backups'));
 
-  const sendBackupFile = (req, res) => {
+  const sendBackupFile = async (req, res) => {
     let data;
     try {
-      data = req.service.exportBackup(idParam(req));
+      data = await req.service.exportBackup(idParam(req));
     } catch (err) {
       return notFound(res, userMessageOf(err), req);
     }
@@ -669,30 +684,30 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
   };
 
   /** A backup of a locked profile asks for its passcode before the download (POSTed back here). */
-  const sendDownloadCode = (req, res, holder, error = null, code = 200) => sendPage(res, passcodePage({
-    ...page(req), profile: holder, picture: avatarUrl(holder), action: `/backups/${idParam(req)}/download`, error,
+  const sendDownloadCode = async (req, res, holder, error = null, code = 200) => sendPage(res, passcodePage({
+    ...(await page(req)), profile: holder, picture: avatarUrl(holder), action: `/backups/${idParam(req)}/download`, error,
     cancel: '/backups', title: 'Download backup', tab: 'backups',
   }), code);
 
-  r.get('/backups/:id/download', (req, res) => {
-    const holder = req.service.lockedHolder(req.service.getBackup(idParam(req)));
-    return holder ? sendDownloadCode(req, res, holder) : sendBackupFile(req, res);
+  r.get('/backups/:id/download', async (req, res) => {
+    const holder = await req.service.lockedHolder(await req.service.getBackup(idParam(req)));
+    return holder ? await sendDownloadCode(req, res, holder) : await sendBackupFile(req, res);
   });
 
   r.post('/backups/:id/download', async (req, res) => {
     try {
       await req.service.checkBackupPasscode(idParam(req), typeof req.body.passcode === 'string' ? req.body.passcode : null);
     } catch (err) {
-      const holder = req.service.lockedHolder(req.service.getBackup(idParam(req)));
-      if (holder && Object.hasOwn(PASSCODE_REFUSALS, err.code)) return sendDownloadCode(req, res, holder, err.userMessage, PASSCODE_REFUSALS[err.code]);
+      const holder = await req.service.lockedHolder(await req.service.getBackup(idParam(req)));
+      if (holder && Object.hasOwn(PASSCODE_REFUSALS, err.code)) return await sendDownloadCode(req, res, holder, err.userMessage, PASSCODE_REFUSALS[err.code]);
       throw err;
     }
-    return sendBackupFile(req, res);
+    return await sendBackupFile(req, res);
   });
 
   // ── Install tab ────────────────────────────────────────────────────────────
 
-  r.get('/install', (req, res) => sendPage(res, installPage({ ...page(req), addon: req.service.addonInfo() })));
+  r.get('/install', async (req, res) => sendPage(res, installPage({ ...(await page(req)), addon: await req.service.addonInfo() })));
 
   r.post('/addon/rotate', action(async (req) => {
     const info = await req.service.rotateAddonToken();
@@ -705,28 +720,28 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
 
   // ── Account tab ────────────────────────────────────────────────────────────
 
-  r.get('/account', (req, res) => sendPage(res, accountPage({
-    ...page(req), sessions: auth.listSessions(req), activity: req.service.repo.listActivity(200),
+  r.get('/account', async (req, res) => sendPage(res, accountPage({
+    ...(await page(req)), sessions: await auth.listSessions(req), activity: await req.service.repo.listActivity(200),
   })));
 
   // Before the :id route, which would otherwise match "others".
   r.post('/account/sessions/others/signout', action(async (req) => {
-    auth.signOutOthers(req);
+    await auth.signOutOthers(req);
     return { text: 'Signed out everywhere else.' };
   }, '/account'));
 
   r.post('/account/sessions/:id/signout', action(async (req) => {
-    auth.signOutSession(req, req.params.id);
+    await auth.signOutSession(req, req.params.id);
     return { text: 'Signed out there.' };
   }, '/account'));
 
   r.post('/account/delete', async (req, res) => {
     if (String(req.body.confirm || '').trim().toLowerCase() !== 'delete') {
-      auth.setFlash(req, { type: 'error', text: 'Type DELETE to confirm deleting your OpenProfiles account.' });
+      await auth.setFlash(req, { type: 'error', text: 'Type DELETE to confirm deleting your OpenProfiles account.' });
       return res.redirect(303, '/account#delete');
     }
     await accounts.deleteAccount(req.session.accountId);
-    auth.logout(req, res);
+    await auth.logout(req, res);
     return res.redirect(303, '/signin?deleted=1');
   });
 
@@ -738,13 +753,13 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
     .send(svg);
 
   /** A profile's picture tile, for `service`'s account. */
-  const sendProfileTile = (res, service, id) => {
-    const p = service.repo.getProfile(id);
+  const sendProfileTile = async (res, service, id) => {
+    const p = await service.repo.getProfile(id);
     if (!p) return res.status(404).end();
     let photo = null;
     if (isPhoto(p.avatar_preset)) {
       try {
-        photo = service.repo.getProfilePhoto(p.id);
+        photo = await service.repo.getProfilePhoto(p.id);
       } catch {
         // unreadable: the letter instead
       }
@@ -752,13 +767,13 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
     return sendSvg(res, avatarTileSvg({ name: p.name, colour: p.avatar_colour, avatar: p.avatar_preset, photo }));
   };
 
-  r.get('/avatars/profile/:id.svg', (req, res) => sendProfileTile(res, req.service, idParam(req)));
+  r.get('/avatars/profile/:id.svg', async (req, res) => await sendProfileTile(res, req.service, idParam(req)));
 
   // The photo on its own, for the picture picker. The hash in the link changes with the photo.
-  r.get('/avatars/profile/:id/photo.jpg', (req, res) => {
+  r.get('/avatars/profile/:id/photo.jpg', async (req, res) => {
     let photo = null;
     try {
-      if (req.service.repo.getProfile(idParam(req))) photo = req.service.repo.getProfilePhoto(idParam(req));
+      if (await req.service.repo.getProfile(idParam(req))) photo = await req.service.repo.getProfilePhoto(idParam(req));
     } catch {
       // unreadable
     }
@@ -775,7 +790,7 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
   // ── Server tab: only for whoever runs the server ───────────────────────────
 
   // Everyone else gets the same "nothing here" as any unknown page.
-  const adminOnly = (req, res, next) => (accounts.isAdmin(req.session.accountId) ? next() : notFound(res, "There's nothing here.", req));
+  const adminOnly = (req, res, next) => (req.isAdmin ? next() : notFound(res, "There's nothing here.", req));
 
   /** The facts that stay in the environment, as the Server tab shows them. */
   const fixedFacts = () => [
@@ -785,10 +800,10 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
     ['Encryption key', config.secretKey ? 'From SECRET_KEY' : 'secret.key in the data folder'],
   ];
 
-  r.get('/admin', adminOnly, (req, res) => {
+  r.get('/admin', adminOnly, async (req, res) => {
     const described = Object.fromEntries(Object.values(SECTIONS).flat().map((key) => [key, settings.describe(key)]));
-    const stats = serverStats({ db, dataDir: config.dataDir ?? '.', settings, log, startedAt });
-    return sendPage(res, adminPage({ ...page(req), stats, settings: described, fixed: fixedFacts() }));
+    const stats = await serverStats({ db, dataDir: config.dataDir ?? '.', settings, log, startedAt });
+    return sendPage(res, adminPage({ ...(await page(req)), stats, settings: described, fixed: fixedFacts() }));
   });
 
   const SAVED = {
@@ -798,6 +813,7 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
   r.post('/admin/settings/:section', adminOnly, action(async (req) => {
     const section = String(req.params.section);
     if (!Object.hasOwn(SECTIONS, section)) throw new UserError('SETTINGS', "That isn't a settings section.");
+    await settings.saveSection(section, req.body);
     const changed = settings.saveSection(section, req.body);
     return { text: changed.length ? SAVED[section] : 'Nothing to save: that is how it already was.' };
   }, (req) => `/admin#${Object.hasOwn(SECTIONS, req.params.section) ? req.params.section : ''}`));
@@ -815,8 +831,8 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
   r.post('/admin/logo', adminOnly, oneUpload, express.raw({ type: () => true, limit: LOGO_UPLOAD_MAX }), json(async (req) => {
     const png = await normaliseLogo(req.body);
     if (!png) throw new UserError('LOGO', "That picture couldn't be read. Use a PNG, JPG or WebP file under 2 MB.");
-    settings.setLogo(png);
-    auth.setFlash(req, { type: 'ok', text: 'New logo saved. Stremio shows it from the next switch.' });
+    await settings.setLogo(png);
+    await auth.setFlash(req, { type: 'ok', text: 'New logo saved. Stremio shows it from the next switch.' });
     return { ok: true };
   }));
 
@@ -855,15 +871,15 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
   };
 
   /** The account and profile an unlock link names, or null after answering 404. */
-  const unlockTarget = (req, res) => {
-    const hit = accounts.byAddonToken(req.params.token);
-    const profile = hit?.service.repo.getProfile(idParam(req));
+  const unlockTarget = async (req, res) => {
+    const hit = await accounts.byAddonToken(req.params.token);
+    const profile = hit ? await hit.service.repo.getProfile(idParam(req)) : null;
     if (!profile) {
       sendPage(res, errorPage({ site: site(), status: 404, message: "There's nothing here." }), 404);
       return null;
     }
     accounts.noteAddonUse(hit.account.id);
-    const active = hit.service.repo.getState()?.active_profile_id === profile.id;
+    const active = (await hit.service.repo.getState())?.active_profile_id === profile.id;
     return { ...hit, profile, active, token: req.params.token };
   };
 
@@ -882,14 +898,14 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
     site: site(), profile, switched, target: REDIRECT_TARGETS[autoRefreshTarget(req.get('user-agent'))],
   }));
 
-  app.get('/:token/unlock/:id', (req, res) => {
-    const hit = unlockTarget(req, res);
+  app.get('/:token/unlock/:id', async (req, res) => {
+    const hit = await unlockTarget(req, res);
     if (!hit) return undefined;
     return hit.active ? sendUnlocked(req, res, hit, false) : sendUnlockPage(res, hit);
   });
 
   app.post('/:token/unlock/:id', async (req, res) => {
-    const hit = unlockTarget(req, res);
+    const hit = await unlockTarget(req, res);
     if (!hit) return undefined;
     if (!takeNonce(hit.account.id, hit.profile.id, req.body?.nonce)) {
       return sendUnlockPage(res, hit, 'This page had expired. Enter the passcode again.', 403);
@@ -904,15 +920,15 @@ export function createApp({ config, db, accounts, log, settings = new Settings({
     return res.redirect(303, `/${hit.token}/unlock/${hit.profile.id}/done`);
   });
 
-  app.get('/:token/unlock/:id/done', (req, res) => {
-    const hit = unlockTarget(req, res);
+  app.get('/:token/unlock/:id/done', async (req, res) => {
+    const hit = await unlockTarget(req, res);
     if (!hit) return undefined;
     return hit.active ? sendUnlocked(req, res, hit, true) : res.redirect(303, `/${hit.token}/unlock/${hit.profile.id}`);
   });
 
-  app.get('/:token/avatars/profile/:id.svg', (req, res) => {
-    const hit = accounts.byAddonToken(req.params.token);
-    return hit ? sendProfileTile(res, hit.service, idParam(req)) : res.status(404).end();
+  app.get('/:token/avatars/profile/:id.svg', async (req, res) => {
+    const hit = await accounts.byAddonToken(req.params.token);
+    return hit ? await sendProfileTile(res, hit.service, idParam(req)) : res.status(404).end();
   });
 
   app.use(r);

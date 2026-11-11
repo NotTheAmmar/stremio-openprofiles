@@ -25,14 +25,32 @@ function decodeKey(text, source) {
  * The 32-byte data key: SECRET_KEY if set, else `<dataDir>/secret.key`,
  * generated on first boot. Losing it makes every stored snapshot unreadable,
  * so it lives on the same volume as the database.
+ *
+ * When deploying to platforms with ephemeral filesystems (e.g. Render),
+ * SECRET_KEY must be set as an environment variable: the local filesystem
+ * cannot persist the key between restarts.
  */
 export function loadOrCreateKey({ secretKey, dataDir }) {
   if (secretKey) return decodeKey(secretKey, 'SECRET_KEY');
-  const file = path.join(dataDir, 'secret.key');
-  if (fs.existsSync(file)) return decodeKey(fs.readFileSync(file, 'utf8'), file);
-  const key = crypto.randomBytes(32);
-  fs.writeFileSync(file, `${key.toString('base64')}\n`, { mode: 0o600, flag: 'wx' });
-  return key;
+  // On platforms with ephemeral filesystems, SECRET_KEY must be set.
+  // Fall back to file-based key only when a data directory is available.
+  if (dataDir) {
+    const file = path.join(dataDir, 'secret.key');
+    if (fs.existsSync(file)) return decodeKey(fs.readFileSync(file, 'utf8'), file);
+    const key = crypto.randomBytes(32);
+    try {
+      fs.mkdirSync(dataDir, { recursive: true });
+      fs.writeFileSync(file, `${key.toString('base64')}\n`, { mode: 0o600, flag: 'wx' });
+    } catch {
+      // Can't write to filesystem — that's okay if this is just a first-run key generation.
+      // The key will be lost on restart. Log a warning.
+      console.warn('WARNING: Could not write secret.key to disk. Set SECRET_KEY environment variable for persistent encryption.');
+    }
+    return key;
+  }
+  // No dataDir and no SECRET_KEY: generate an ephemeral key (will break on restart!)
+  console.warn('WARNING: No SECRET_KEY set and no data directory. Generating ephemeral key that will be lost on restart.');
+  return crypto.randomBytes(32);
 }
 
 /**

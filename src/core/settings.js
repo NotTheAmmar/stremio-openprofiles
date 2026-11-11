@@ -137,7 +137,21 @@ export class Settings {
     this.env = env;
     this.now = now;
     this.listeners = [];
-    this.saved = new Map(db.prepare('SELECT key, value FROM settings').all().map((r) => [r.key, JSON.parse(r.value)]));
+    this.saved = new Map();
+  }
+
+  /** Load settings from the database. Must be called after construction. */
+  async init() {
+    const rows = await this.db.all('SELECT key, value FROM settings');
+    this.saved = new Map(rows.map((r) => [r.key, JSON.parse(r.value)]));
+    return this;
+  }
+
+  /** Factory: create and initialize a Settings instance. */
+  static async create(opts) {
+    const s = new Settings(opts);
+    await s.init();
+    return s;
   }
 
   onChange(fn) {
@@ -183,7 +197,7 @@ export class Settings {
    * Save one Server tab form. Every field of the section is validated before
    * anything is written; problems come back together in one SettingsError.
    */
-  saveSection(section, body = {}) {
+  async saveSection(section, body = {}) {
     const keys = SECTIONS[section];
     if (!keys) throw new SettingsError("That isn't a settings section.");
     const problems = [];
@@ -206,7 +220,7 @@ export class Settings {
   }
 
   /** Back to the environment's value (or the default). */
-  reset(key) {
+  async reset(key) {
     if (!Object.hasOwn(FIELDS, key)) throw new SettingsError("That isn't a setting.");
     const after = { access: this.get('access'), allowedAccounts: this.get('allowedAccounts'), [key]: this.inherited(key) };
     if (after.access === 'list' && after.allowedAccounts.length === 0) {
@@ -215,26 +229,25 @@ export class Settings {
     return this.write({ [key]: this.inherited(key) });
   }
 
-  write(values) {
+  async write(values) {
     const changed = [];
-    const upsert = this.db.prepare(`INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
-      ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`);
-    const remove = this.db.prepare('DELETE FROM settings WHERE key = ?');
-    this.db.transaction(() => {
+    await this.db.transaction(async (tx) => {
       for (const [key, value] of Object.entries(values)) {
         const before = this.get(key);
         if (same(value, this.inherited(key))) {
           if (this.saved.has(key)) {
-            remove.run(key);
+            await tx.run('DELETE FROM settings WHERE key = $1', [key]);
             this.saved.delete(key);
           }
         } else {
-          upsert.run(key, JSON.stringify(value), this.now());
+          await tx.run(`INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, $3)
+      ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+            [key, JSON.stringify(value), this.now()]);
           this.saved.set(key, value);
         }
         if (!same(before, this.get(key))) changed.push(key);
       }
-    })();
+    });
     if (changed.length) for (const fn of this.listeners) fn(changed);
     return changed;
   }
@@ -252,15 +265,15 @@ export class Settings {
   }
 
   /** `png` must already be re-encoded (art.js normaliseLogo); null removes the upload. */
-  setLogo(png) {
-    const upsert = this.db.prepare(`INSERT INTO settings (key, value, updated_at) VALUES ('logo', ?, ?)
-      ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`);
+  async setLogo(png) {
     if (png) {
       const value = { png: png.toString('base64'), hash: crypto.createHash('sha1').update(png).digest('hex').slice(0, 10) };
-      upsert.run(JSON.stringify(value), this.now());
+      await this.db.run(`INSERT INTO settings (key, value, updated_at) VALUES ('logo', $1, $2)
+      ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+        [JSON.stringify(value), this.now()]);
       this.saved.set('logo', value);
     } else {
-      this.db.prepare("DELETE FROM settings WHERE key = 'logo'").run();
+      await this.db.run("DELETE FROM settings WHERE key = 'logo'");
       this.saved.delete('logo');
     }
     for (const fn of this.listeners) fn(['logo']);
@@ -301,4 +314,3 @@ export class Settings {
     };
   }
 }
-

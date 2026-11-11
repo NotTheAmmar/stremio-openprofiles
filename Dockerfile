@@ -20,6 +20,7 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json LICENSE ./
 COPY src ./src
+COPY scripts ./scripts
 RUN mkdir -p /data && chown node:node /data && chmod 700 /data
 USER node
 VOLUME /data

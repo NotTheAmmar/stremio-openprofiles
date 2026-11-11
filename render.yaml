@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: stremio-openprofiles
+    runtime: node
+    plan: free
+    region: oregon
+    buildCommand: npm ci --omit=dev
+    startCommand: node src/server.js
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: SECRET_KEY
+        sync: false
+      - key: PUBLIC_URL
+        sync: false
+      - key: ACCESS
+        value: owner
+      - key: TRUST_PROXY
+        value: "1"

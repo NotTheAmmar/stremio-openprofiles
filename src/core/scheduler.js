@@ -1,12 +1,8 @@
-import fs from 'node:fs';
-import path from 'node:path';
 import { silentLogger } from '../log.js';
 import { BIN_DAYS } from './service.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 export const SNAPSHOT_RE = /^openprofiles-(\d{4}-\d{2}-\d{2})\.db$/;
-const KEEP_DAILY = 7;
-const KEEP_WEEKLY_DAYS = 28;
 // Unused accounts: a longer pause between daily runs means the server was down (see runDaily),
 // and one run removes at most this many, so a mistake can't empty a server in one night.
 const CLOCK_GAP_MS = 2 * DAY_MS;
@@ -15,62 +11,30 @@ const MAX_REMOVALS = 5;
 const dayOf = (ms) => new Date(ms).toISOString().slice(0, 10);
 
 /**
- * A consistent copy of the whole database (VACUUM INTO), one per day, in
- * <dataDir>/snapshots. Keeps the last 7 days plus Sundays of the last 4 weeks.
- * The copies are as encrypted as the database; secret.key is still needed.
- */
-export function snapshotDatabase(db, dataDir, now = Date.now()) {
-  const dir = path.join(dataDir, 'snapshots');
-  fs.mkdirSync(dir, { recursive: true });
-  const file = path.join(dir, `openprofiles-${dayOf(now)}.db`);
-  if (!fs.existsSync(file)) {
-    const partial = `${file}.partial`;
-    fs.rmSync(partial, { force: true });
-    db.prepare('VACUUM INTO ?').run(partial);
-    fs.renameSync(partial, file);
-  }
-  for (const name of fs.readdirSync(dir)) {
-    const m = SNAPSHOT_RE.exec(name);
-    if (!m) continue;
-    const at = Date.parse(`${m[1]}T00:00:00Z`);
-    const age = (Date.parse(`${dayOf(now)}T00:00:00Z`) - at) / DAY_MS;
-    const sunday = new Date(at).getUTCDay() === 0;
-    if (age < KEEP_DAILY || (sunday && age < KEEP_WEEKLY_DAYS)) continue;
-    fs.rmSync(path.join(dir, name), { force: true });
-  }
-  return file;
-}
-
-/**
- * The once-a-day jobs: database snapshot, removing accounts nobody has used
+ * The once-a-day jobs: removing accounts nobody has used
  * for removeUnusedDays of the server running (shared servers with ACCESS=open only), each account's
  * automatic backup (skipped when nothing changed) and emptying bins of
  * profiles deleted more than BIN_DAYS ago. One account's failure doesn't stop
  * the others.
  */
-export async function runDaily({ db, dataDir, accounts, settings = null, log = silentLogger, now = () => Date.now(), pause = () => new Promise((r) => setTimeout(r, 2000)) }) {
-  const summary = { snapshot: null, removed: 0, backedUp: 0, skipped: 0, failed: 0, purged: 0 };
-  try {
-    summary.snapshot = snapshotDatabase(db, dataDir, now());
-  } catch (err) {
-    log.error('Database snapshot failed', { error: err.message });
-  }
-  const meta = (key) => db.prepare('SELECT value FROM meta WHERE key = ?').get(key)?.value ?? null;
-  const setMeta = db.prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value');
+export async function runDaily({ db, accounts, settings = null, log = silentLogger, now = () => Date.now(), pause = () => new Promise((r) => setTimeout(r, 2000)) }) {
+  const summary = { removed: 0, backedUp: 0, skipped: 0, failed: 0, purged: 0 };
+  const meta = async (key) => (await db.get('SELECT value FROM meta WHERE key = $1', [key]))?.value ?? null;
+  const setMeta = async (key, value) => await db.run('INSERT INTO meta (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = excluded.value', [key, value]);
   // "Unused" only counts time the server was up: nobody could use it while it was down. After a
   // gap (no run for over CLOCK_GAP_MS, or never) the count starts again from now.
   let previous = null;
   try {
-    previous = JSON.parse(meta('last_daily_summary'))?.at ?? null;
+    previous = JSON.parse(await meta('last_daily_summary'))?.at ?? null;
   } catch {
     // never ran, or written by an older version
   }
-  if (previous == null || now() - previous > CLOCK_GAP_MS || meta('unused_clock_since') == null) {
-    setMeta.run('unused_clock_since', String(now()));
+  if (previous == null || now() - previous > CLOCK_GAP_MS || (await meta('unused_clock_since')) == null) {
+    await setMeta('unused_clock_since', String(now()));
   }
   const days = settings && settings.get('access') === 'open' ? settings.get('removeUnusedDays') : 0;
   const since = now() - days * DAY_MS;
-  if (days > 0 && since >= Number(meta('unused_clock_since'))) {
+  if (days > 0 && since >= Number(await meta('unused_clock_since'))) {
     try {
       const { removed, left } = await accounts.removeUnused(since, { limit: MAX_REMOVALS });
       summary.removed = removed;
@@ -79,7 +43,7 @@ export async function runDaily({ db, dataDir, accounts, settings = null, log = s
       log.error('Removing unused accounts failed', { error: err.message });
     }
   }
-  const ids = db.prepare('SELECT id FROM accounts ORDER BY id').all().map((r) => r.id);
+  const ids = (await db.all('SELECT id FROM accounts ORDER BY id')).map((r) => r.id);
   for (const [i, id] of ids.entries()) {
     const service = accounts.forAccount(id);
     try {
@@ -97,10 +61,10 @@ export async function runDaily({ db, dataDir, accounts, settings = null, log = s
     }
     if (i < ids.length - 1) await pause();
   }
-  setMeta.run('last_daily', dayOf(now()));
+  await setMeta('last_daily', dayOf(now()));
   // Counts only, for the Server tab.
-  setMeta.run('last_daily_summary', JSON.stringify({ at: now(), ...summary, snapshot: Boolean(summary.snapshot) }));
-  log.info('Daily jobs done', { ...summary, snapshot: summary.snapshot ? path.basename(summary.snapshot) : null });
+  await setMeta('last_daily_summary', JSON.stringify({ at: now(), ...summary }));
+  log.info('Daily jobs done', summary);
   return summary;
 }
 
@@ -124,7 +88,7 @@ export async function checkCarryovers({ accounts, log = silentLogger }) {
  * Runs the daily jobs once per UTC day (shortly after boot if due, then
  * checks hourly), and the carry-over check every CARRYOVER_CHECK_MS.
  */
-export function startScheduler({ db, dataDir, accounts, settings = null, log = silentLogger }) {
+export function startScheduler({ db, accounts, settings = null, log = silentLogger }) {
   let checking = false;
   const check = async () => {
     if (checking) return;
@@ -141,11 +105,12 @@ export function startScheduler({ db, dataDir, accounts, settings = null, log = s
   let running = false;
   const tick = async () => {
     if (running) return;
-    const last = db.prepare("SELECT value FROM meta WHERE key = 'last_daily'").get()?.value;
+    const row = await db.get("SELECT value FROM meta WHERE key = 'last_daily'");
+    const last = row?.value;
     if (last === dayOf(Date.now())) return;
     running = true;
     try {
-      await runDaily({ db, dataDir, accounts, settings, log });
+      await runDaily({ db, accounts, settings, log });
     } catch (err) {
       log.error('Daily jobs failed', { error: err.message });
     } finally {

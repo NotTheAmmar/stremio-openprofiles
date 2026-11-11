@@ -81,23 +81,6 @@ export function createAuth({ db, config, now = () => Date.now() }) {
   const byIp = limiter(MAX_ATTEMPTS_PER_IP, now);
   const byEmail = limiter(MAX_ATTEMPTS_PER_EMAIL, now);
 
-  const q = {
-    insert: db.prepare(`INSERT INTO sessions (id_hash, account_id, csrf, user_agent, created_at, last_seen_at, expires_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)`),
-    get: db.prepare('SELECT * FROM sessions WHERE id_hash = ? AND expires_at > ?'),
-    touch: db.prepare('UPDATE sessions SET last_seen_at = ?, expires_at = ? WHERE id_hash = ?'),
-    // On the account too, at most hourly: its sessions can expire or be signed out, and
-    // "unused" (core/repo.js USED_SINCE) must still see the visit.
-    seen: db.prepare('UPDATE accounts SET last_seen_at = @now WHERE id = @id AND (last_seen_at IS NULL OR last_seen_at < @now - @every)'),
-    remove: db.prepare('DELETE FROM sessions WHERE id_hash = ?'),
-    removeForAccount: db.prepare('DELETE FROM sessions WHERE account_id = ? AND hex(id_hash) = ?'),
-    removeOthers: db.prepare('DELETE FROM sessions WHERE account_id = ? AND id_hash != ?'),
-    list: db.prepare(`SELECT hex(id_hash) AS id, user_agent, created_at, last_seen_at FROM sessions
-      WHERE account_id = ? AND expires_at > ? ORDER BY last_seen_at DESC`),
-    expire: db.prepare('DELETE FROM sessions WHERE expires_at <= ?'),
-    setFlash: db.prepare('UPDATE sessions SET flash = ? WHERE id_hash = ?'),
-  };
-
   function cookie(value, maxAgeMs) {
     return [
       `${COOKIE}=${value}`, 'Path=/', 'HttpOnly', 'SameSite=Strict', `Max-Age=${Math.floor(maxAgeMs / 1000)}`,
@@ -105,15 +88,15 @@ export function createAuth({ db, config, now = () => Date.now() }) {
     ].join('; ');
   }
 
-  function loadSession(req) {
+  async function loadSession(req) {
     const token = parseCookies(req.headers.cookie)[COOKIE];
     if (!token) return null;
-    const row = q.get.get(sha256(token), now());
+    const row = await db.get('SELECT * FROM sessions WHERE id_hash = $1 AND expires_at > $2', [sha256(token), now()]);
     if (!row) return null;
     // Idle expiry: each visit (at most every few minutes) pushes it out again.
     if (now() - row.last_seen_at > TOUCH_EVERY_MS) {
-      q.touch.run(now(), now() + SESSION_TTL_MS, row.id_hash);
-      q.seen.run({ now: now(), id: row.account_id, every: SEEN_EVERY_MS });
+      await db.run('UPDATE sessions SET last_seen_at = $1, expires_at = $2 WHERE id_hash = $3', [now(), now() + SESSION_TTL_MS, row.id_hash]);
+      await db.run('UPDATE accounts SET last_seen_at = $1 WHERE id = $2 AND (last_seen_at IS NULL OR last_seen_at < $1 - $3)', [now(), row.account_id, SEEN_EVERY_MS]);
     }
     return { idHash: row.id_hash, accountId: row.account_id, csrf: row.csrf, flash: row.flash, createdAt: row.created_at };
   }
@@ -134,49 +117,66 @@ export function createAuth({ db, config, now = () => Date.now() }) {
     },
 
     /** After Stremio accepted the sign-in: start a session for the account and set the cookie. */
-    startSession(req, res, accountId, email, flash = null) {
+    async startSession(req, res, accountId, email, flash = null) {
       byEmail.clear(String(email || '').trim().toLowerCase());
-      q.expire.run(now());
+      await db.run('DELETE FROM sessions WHERE expires_at <= $1', [now()]);
       const token = randomToken(32);
       const ua = String(req.get('user-agent') || '').slice(0, 300);
       const idHash = sha256(token);
-      q.insert.run(idHash, accountId, randomToken(24), ua, now(), now(), now() + SESSION_TTL_MS);
-      q.seen.run({ now: now(), id: accountId, every: 0 });
-      if (flash) q.setFlash.run(JSON.stringify(flash), idHash);
+      await db.run(
+        `INSERT INTO sessions (id_hash, account_id, csrf, user_agent, created_at, last_seen_at, expires_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [idHash, accountId, randomToken(24), ua, now(), now(), now() + SESSION_TTL_MS],
+      );
+      await db.run('UPDATE accounts SET last_seen_at = $1 WHERE id = $2 AND (last_seen_at IS NULL OR last_seen_at < $1 - $3)', [now(), accountId, 0]);
+      if (flash) await db.run('UPDATE sessions SET flash = $1 WHERE id_hash = $2', [JSON.stringify(flash), idHash]);
       res.setHeader('Set-Cookie', cookie(token, SESSION_TTL_MS));
     },
 
-    logout(req, res) {
-      if (req.session) q.remove.run(req.session.idHash);
+    async logout(req, res) {
+      if (req.session) await db.run('DELETE FROM sessions WHERE id_hash = $1', [req.session.idHash]);
       res.setHeader('Set-Cookie', cookie('', 0));
     },
 
     /** Where this account is signed in. `current` marks the session making the request. */
-    listSessions(req) {
+    async listSessions(req) {
       const current = Buffer.from(req.session.idHash).toString('hex').toUpperCase();
-      return q.list.all(req.session.accountId, now()).map((s) => ({ ...s, current: s.id === current }));
+      const rows = await db.all(
+        `SELECT encode(id_hash, 'hex') AS id, user_agent, created_at, last_seen_at FROM sessions
+      WHERE account_id = $1 AND expires_at > $2 ORDER BY last_seen_at DESC`,
+        [req.session.accountId, now()],
+      );
+      return rows.map((s) => ({ ...s, current: s.id === current }));
     },
 
-    signOutSession(req, id) {
-      q.removeForAccount.run(req.session.accountId, String(id).toUpperCase());
+    async signOutSession(req, id) {
+      await db.run('DELETE FROM sessions WHERE account_id = $1 AND encode(id_hash, \'hex\') = $2', [req.session.accountId, String(id).toUpperCase()]);
     },
 
-    signOutOthers(req) {
-      q.removeOthers.run(req.session.accountId, req.session.idHash);
+    async signOutOthers(req) {
+      await db.run('DELETE FROM sessions WHERE account_id = $1 AND id_hash != $2', [req.session.accountId, req.session.idHash]);
     },
 
     /** Gate: signed-out GETs go to the sign-in page, other methods get 401. */
-    require(req, res, next) {
-      req.session = loadSession(req);
-      if (req.session) return next();
-      if (wantsJson(req)) return res.status(401).json({ error: 'You were signed out. Reload the page and sign in again.' });
-      return res.redirect(303, '/signin');
+    async require(req, res, next) {
+      try {
+        req.session = await loadSession(req);
+        if (req.session) return next();
+        if (wantsJson(req)) return res.status(401).json({ error: 'You were signed out. Reload the page and sign in again.' });
+        return res.redirect(303, '/signin');
+      } catch (err) {
+        next(err);
+      }
     },
 
     /** Like require, but lets signed-out requests through (for the sign-in page itself). */
-    optional(req, res, next) {
-      req.session = loadSession(req);
-      next();
+    async optional(req, res, next) {
+      try {
+        req.session = await loadSession(req);
+        next();
+      } catch (err) {
+        next(err);
+      }
     },
 
     csrf(req, res, next) {
@@ -188,8 +188,8 @@ export function createAuth({ db, config, now = () => Date.now() }) {
       return res.status(403).type('text').send('This form expired. Go back, reload the page and try again.');
     },
 
-    setFlash(req, flash) {
-      q.setFlash.run(JSON.stringify(flash), req.session.idHash);
+    async setFlash(req, flash) {
+      await db.run('UPDATE sessions SET flash = $1 WHERE id_hash = $2', [JSON.stringify(flash), req.session.idHash]);
     },
 
     /** The edit whose Undo bar this browser hid (a later edit shows the bar again). */
@@ -204,10 +204,12 @@ export function createAuth({ db, config, now = () => Date.now() }) {
       ].join('; '));
     },
 
-    takeFlash(req) {
+    async takeFlash(req) {
       if (!req.session?.flash) return null;
-      q.setFlash.run(null, req.session.idHash);
-      return JSON.parse(req.session.flash);
+      const flash = JSON.parse(req.session.flash);
+      req.session.flash = null;
+      await db.run('UPDATE sessions SET flash = $1 WHERE id_hash = $2', [null, req.session.idHash]);
+      return flash;
     },
   };
 }

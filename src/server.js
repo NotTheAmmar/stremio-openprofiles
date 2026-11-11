@@ -1,4 +1,3 @@
-import fs from 'node:fs';
 import { createSelfAddon } from './addon/manifest.js';
 import { ConfigError, loadConfig } from './config.js';
 import { Cipher, loadOrCreateKey } from './crypto.js';
@@ -15,7 +14,7 @@ import { createApp } from './web/app.js';
 
 const SHUTDOWN_GRACE_MS = 25_000;
 
-function main() {
+async function main() {
   let config;
   try {
     config = loadConfig();
@@ -31,14 +30,22 @@ function main() {
     log.warn('ADMIN_PASSWORD is no longer used: people sign in with their Stremio account. Remove it from your settings.');
   }
 
-  // Everything this process writes (database, WAL, nightly snapshots) is for its own user only.
-  process.umask(0o077);
-  fs.mkdirSync(config.dataDir, { recursive: true });
+  // Load or generate the encryption key.
   const key = loadOrCreateKey(config);
   const cipher = new Cipher(key);
-  const db = openDatabase(config.dataDir);
+
+  // Connect to PostgreSQL (Supabase).
+  let db;
   try {
-    checkSecretKey(db, key, cipher);
+    db = await openDatabase(config.databaseUrl);
+    log.info('Connected to PostgreSQL');
+  } catch (err) {
+    log.error(`Database connection failed: ${err.message}`);
+    process.exit(1);
+  }
+
+  try {
+    await checkSecretKey(db, key, cipher);
   } catch (err) {
     if (err instanceof WrongKeyError) {
       log.error(err.message);
@@ -46,9 +53,10 @@ function main() {
     }
     throw err;
   }
-  upgradeLegacyEncryption(db, cipher, log);
+  await upgradeLegacyEncryption(db, cipher, log);
+
   // Server tab values override the environment's from here on.
-  const settings = new Settings({ db, env: process.env });
+  const settings = await Settings.create({ db, env: process.env });
   log.setLevel(settings.get('logLevel'));
   settings.onChange((keys) => {
     if (keys.includes('logLevel')) log.setLevel(settings.get('logLevel'));
@@ -63,15 +71,16 @@ function main() {
     fetchManifest: (url) => fetchManifest(url, { allowPrivate: config.allowPrivateAddons }),
   });
 
-  const open = db.prepare("SELECT COUNT(*) AS n FROM switch_journal WHERE status = 'open'").get().n;
-  if (open) log.warn('Some earlier switches did not finish; each account sees a recovery prompt on its page', { open });
-  log.info('Access rule', { mode: settings.access().mode, accounts: accounts.accounts.count() });
+  const openCount = await db.get("SELECT COUNT(*) AS n FROM switch_journal WHERE status = 'open'");
+  if (openCount?.n) log.warn('Some earlier switches did not finish; each account sees a recovery prompt on its page', { open: openCount.n });
+  const accountCount = await accounts.accounts.count();
+  log.info('Access rule', { mode: settings.access().mode, accounts: accountCount });
 
-  const scheduler = startScheduler({ db, dataDir: config.dataDir, accounts, settings, log });
+  const scheduler = startScheduler({ db, accounts, settings, log });
 
   const app = createApp({ config, db, accounts, log, settings });
-  const server = app.listen(config.port, () => {
-    log.info(`OpenProfiles listening on port ${config.port}`, { publicUrl: config.publicUrl, dataDir: config.dataDir });
+  const server = app.listen(config.port, '0.0.0.0', () => {
+    log.info(`OpenProfiles listening on port ${config.port}`, { publicUrl: config.publicUrl });
   });
 
   // Let running switches finish before exiting; if one can't in time, its
@@ -86,7 +95,7 @@ function main() {
     const timeout = new Promise((resolve) => setTimeout(resolve, SHUTDOWN_GRACE_MS).unref());
     const idle = Promise.all([...accounts.services.values()].map((s) => s.lock.idle()));
     await Promise.race([idle, timeout]);
-    db.close();
+    await db.close();
     process.exit(0);
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
