@@ -95,8 +95,9 @@ export function createAuth({ db, config, now = () => Date.now() }) {
     if (!row) return null;
     // Idle expiry: each visit (at most every few minutes) pushes it out again.
     if (now() - row.last_seen_at > TOUCH_EVERY_MS) {
-      await db.run('UPDATE sessions SET last_seen_at = $1, expires_at = $2 WHERE id_hash = $3', [now(), now() + SESSION_TTL_MS, row.id_hash]);
-      await db.run('UPDATE accounts SET last_seen_at = $1 WHERE id = $2 AND (last_seen_at IS NULL OR last_seen_at < $1 - $3)', [now(), row.account_id, SEEN_EVERY_MS]);
+      const t = now();
+      await db.run('UPDATE sessions SET last_seen_at = $1, expires_at = $2 WHERE id_hash = $3', [t, t + SESSION_TTL_MS, row.id_hash]);
+      await db.run('UPDATE accounts SET last_seen_at = $1 WHERE id = $2 AND (last_seen_at IS NULL OR last_seen_at < $3)', [t, row.account_id, t - SEEN_EVERY_MS]);
     }
     return { idHash: row.id_hash, accountId: row.account_id, csrf: row.csrf, flash: row.flash, createdAt: row.created_at };
   }
@@ -119,16 +120,17 @@ export function createAuth({ db, config, now = () => Date.now() }) {
     /** After Stremio accepted the sign-in: start a session for the account and set the cookie. */
     async startSession(req, res, accountId, email, flash = null) {
       byEmail.clear(String(email || '').trim().toLowerCase());
-      await db.run('DELETE FROM sessions WHERE expires_at <= $1', [now()]);
+      const t = now();
+      await db.run('DELETE FROM sessions WHERE expires_at <= $1', [t]);
       const token = randomToken(32);
       const ua = String(req.get('user-agent') || '').slice(0, 300);
       const idHash = sha256(token);
       await db.run(
         `INSERT INTO sessions (id_hash, account_id, csrf, user_agent, created_at, last_seen_at, expires_at)
       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-        [idHash, accountId, randomToken(24), ua, now(), now(), now() + SESSION_TTL_MS],
+        [idHash, accountId, randomToken(24), ua, t, t, t + SESSION_TTL_MS],
       );
-      await db.run('UPDATE accounts SET last_seen_at = $1 WHERE id = $2 AND (last_seen_at IS NULL OR last_seen_at < $1 - $3)', [now(), accountId, 0]);
+      await db.run('UPDATE accounts SET last_seen_at = $1 WHERE id = $2', [t, accountId]);
       if (flash) await db.run('UPDATE sessions SET flash = $1 WHERE id_hash = $2', [JSON.stringify(flash), idHash]);
       res.setHeader('Set-Cookie', cookie(token, SESSION_TTL_MS));
     },
@@ -140,17 +142,17 @@ export function createAuth({ db, config, now = () => Date.now() }) {
 
     /** Where this account is signed in. `current` marks the session making the request. */
     async listSessions(req) {
-      const current = Buffer.from(req.session.idHash).toString('hex').toUpperCase();
+      const current = Buffer.from(req.session.idHash).toString('hex').toLowerCase();
       const rows = await db.all(
         `SELECT encode(id_hash, 'hex') AS id, user_agent, created_at, last_seen_at FROM sessions
       WHERE account_id = $1 AND expires_at > $2 ORDER BY last_seen_at DESC`,
         [req.session.accountId, now()],
       );
-      return rows.map((s) => ({ ...s, current: s.id === current }));
+      return rows.map((s) => ({ ...s, current: String(s.id).toLowerCase() === current }));
     },
 
     async signOutSession(req, id) {
-      await db.run('DELETE FROM sessions WHERE account_id = $1 AND encode(id_hash, \'hex\') = $2', [req.session.accountId, String(id).toUpperCase()]);
+      await db.run('DELETE FROM sessions WHERE account_id = $1 AND lower(encode(id_hash, \'hex\')) = lower($2)', [req.session.accountId, String(id)]);
     },
 
     async signOutOthers(req) {

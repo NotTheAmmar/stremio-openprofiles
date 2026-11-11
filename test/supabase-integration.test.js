@@ -180,6 +180,11 @@ class InMemoryPgDatabase {
       if (acct) acct.addon_installed = params[0];
       return { rows: [], rowCount: acct ? 1 : 0 };
     }
+    if (norm.startsWith('UPDATE accounts SET last_seen_at = $1 WHERE id = $2')) {
+      const acct = this.tables.accounts.get(Number(params[1]));
+      if (acct) acct.last_seen_at = params[0];
+      return { rows: [], rowCount: acct ? 1 : 0 };
+    }
     if (norm.startsWith('UPDATE accounts SET last_addon_at = $1 WHERE id = $2')) {
       const acct = this.tables.accounts.get(Number(params[1]));
       if (acct) acct.last_addon_at = params[0];
