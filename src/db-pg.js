@@ -154,6 +154,14 @@ export async function openDatabase(connectionString, { maxRetries = 5, retryDela
     max: 10,
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 10000,
+    keepAlive: true,
+    keepAliveInitialDelayMillis: 10000,
+  });
+
+  // Handle errors on idle pool clients gracefully to prevent unhandled exceptions from terminating Node
+  pool.on('error', (err) => {
+    // Idle connection terminations by Supabase/remote firewall are expected and recovered by pg.Pool
+    console.warn('Unexpected error on idle PostgreSQL client (auto-recovering):', err.message);
   });
 
   // Test connection with retries
@@ -265,11 +273,17 @@ export class PgDatabase {
 
   /** Check if the database connection is healthy. */
   async healthy() {
+    let timer;
     try {
-      await this.pool.query('SELECT 1');
+      const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('Health check timeout')), 5000);
+      });
+      await Promise.race([this.pool.query('SELECT 1'), timeout]);
       return true;
     } catch {
       return false;
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 

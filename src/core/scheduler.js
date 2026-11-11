@@ -55,7 +55,7 @@ export async function runDaily({ db, accounts, settings = null, log = silentLogg
       log.warn('Daily backup failed for an account', { accountId: id, error: err.userMessage || err.message });
     }
     try {
-      summary.purged += service.repo.purgeBin(now() - BIN_DAYS * DAY_MS);
+      summary.purged += await service.repo.purgeBin(now() - BIN_DAYS * DAY_MS);
     } catch (err) {
       log.warn('Emptying the bin failed for an account', { accountId: id, error: err.message });
     }
@@ -74,7 +74,7 @@ export const CARRYOVER_CHECK_MS = 3 * 60 * 1000;
 /** One round of the check, for every account following such titles. Returns how many were put back. */
 export async function checkCarryovers({ accounts, log = silentLogger }) {
   let settled = 0;
-  for (const id of accounts.accounts.withCarryovers()) {
+  for (const id of await accounts.accounts.withCarryovers()) {
     try {
       settled += (await accounts.forAccount(id).checkCarryovers()).settled;
     } catch (err) {
@@ -95,6 +95,8 @@ export function startScheduler({ db, accounts, settings = null, log = silentLogg
     checking = true;
     try {
       await checkCarryovers({ accounts, log });
+    } catch (err) {
+      log.error('Carryover check failed', { error: err.message });
     } finally {
       checking = false;
     }
@@ -105,16 +107,20 @@ export function startScheduler({ db, accounts, settings = null, log = silentLogg
   let running = false;
   const tick = async () => {
     if (running) return;
-    const row = await db.get("SELECT value FROM meta WHERE key = 'last_daily'");
-    const last = row?.value;
-    if (last === dayOf(Date.now())) return;
-    running = true;
     try {
-      await runDaily({ db, accounts, settings, log });
+      const row = await db.get("SELECT value FROM meta WHERE key = 'last_daily'");
+      const last = row?.value;
+      if (last === dayOf(Date.now())) return;
+      running = true;
+      try {
+        await runDaily({ db, accounts, settings, log });
+      } catch (err) {
+        log.error('Daily jobs failed', { error: err.message });
+      } finally {
+        running = false;
+      }
     } catch (err) {
-      log.error('Daily jobs failed', { error: err.message });
-    } finally {
-      running = false;
+      log.error('Daily tick failed', { error: err.message });
     }
   };
   const first = setTimeout(tick, 2 * 60 * 1000);

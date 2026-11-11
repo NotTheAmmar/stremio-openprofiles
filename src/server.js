@@ -26,6 +26,14 @@ async function main() {
     throw err;
   }
   const log = createLogger(config.logLevel);
+
+  process.on('uncaughtException', (err) => {
+    log.error('Uncaught Exception', { error: err?.message || String(err), stack: err?.stack });
+  });
+
+  process.on('unhandledRejection', (reason) => {
+    log.error('Unhandled Rejection', { reason: reason?.message || String(reason), stack: reason?.stack });
+  });
   if (config.legacyAdminPassword) {
     log.warn('ADMIN_PASSWORD is no longer used: people sign in with their Stremio account. Remove it from your settings.');
   }

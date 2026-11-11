@@ -5,6 +5,7 @@ import { describe, it, beforeEach } from 'node:test';
 import { Cipher } from '../src/crypto.js';
 import { checkSecretKey } from '../src/core/keycheck.js';
 import { AccountsService, accessDecision } from '../src/core/accounts.js';
+import { checkCarryovers, startScheduler } from '../src/core/scheduler.js';
 import { Settings } from '../src/core/settings.js';
 import { createAuth } from '../src/web/auth.js';
 import { createApp } from '../src/web/app.js';
@@ -441,6 +442,12 @@ class InMemoryPgDatabase {
       return { rows: [{ id }], rowCount: 1 };
     }
 
+    // CARRYOVERS TABLE
+    if (norm.includes('FROM carryovers')) {
+      const list = Array.from(this.tables.carryovers.values()).map(c => ({ account_id: c.account_id }));
+      return { rows: list, rowCount: list.length };
+    }
+
     return { rows: [], rowCount: 0 };
   }
 }
@@ -781,6 +788,19 @@ if (optErr) console.error("[OPTIONAL ERROR]", optErr);
 
       const fetchedSetting = await db.get('SELECT key, value FROM settings');
       assert.ok(fetchedSetting);
+    });
+  });
+
+  describe('8. Background Scheduler & Carryovers', () => {
+    it('executes checkCarryovers and starts scheduler without throwing unhandled promise rejections', async () => {
+      // Must not throw "withCarryovers is not iterable" when withCarryovers is async
+      const count = await checkCarryovers({ accounts });
+      assert.equal(count, 0);
+
+      const scheduler = startScheduler({ db, accounts, settings });
+      assert.ok(scheduler);
+      assert.equal(typeof scheduler.stop, 'function');
+      scheduler.stop();
     });
   });
 });
